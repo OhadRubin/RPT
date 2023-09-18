@@ -19,6 +19,80 @@ from jax.experimental.pjit import pjit
 from jax.interpreters import pxla
 import numpy as np
 from transformers import FlaxLogitsWarper
+from absl import logging
+from einops import rearrange
+unfreeze = flax.core.unfreeze
+flatten_dict = flax.traverse_util.flatten_dict
+
+from einops import reduce
+
+# print_attention_mask(max_pooling(attention_mask,64))
+# 
+# X = flatten_tree(,sep="/")["0/transformer/upcoder/layers/0/attention/attn_weights/0"][0][0][:,:-1] >0
+# print_attention_mask(max_pooling(X,16))
+
+def print_attention_from_intermediates(intermediates,pat="attn_weights",has_null=True,factor=16):
+    assert has_null
+    intermediates = jax.device_get(intermediates)
+    for key, value in flatten_tree(intermediates,sep="/").items():
+        if pat in key:
+            value = value[0][0]
+            if has_null:
+                value = value[:,:-1]
+                
+            print(key)
+            print_attention_mask(max_pooling(value > 0,factor))
+            print("----")
+
+def print_attention_mask(mask):
+    mask = np.asarray(mask).astype(int).squeeze()
+    for row in mask:
+        formatted_row = ' '.join(['■' if x == 1 else '□' for x in row])
+        print(formatted_row)
+
+def max_pooling(x,k=2):
+    return reduce(x, '... (h1 h2) (w1 w2) -> ... h1 w1', 'max', h2=k, w2=k)
+
+def add_process_dim(x):
+    """ Add a process dimension to a tensor. """
+    if x is None or not hasattr(x, 'shape'):
+        return x
+    return rearrange(x, '(p l)  ... -> p l ... ', p=jax.process_count())
+    # return x.reshape((num_processes, -1) + x.shape[1:])
+def remove_process_dim(x):
+    """Remove the process dimension from a tensor."""
+    if x is None or not hasattr(x, 'shape'):
+        return x
+    if np.prod(x.shape)==1:
+        return x.reshape([])
+    if len(x.shape) <= 1:
+        return x
+    return rearrange(x, 'p l ... -> (p l) ...', p=jax.process_count())
+    
+
+
+def put_along_zeroth_axis(arr,indices,values):
+    arng = jnp.arange(arr.shape[0]).reshape(-1,1)
+    return arr.at[arng, indices].set(values) 
+
+def create_target_scores(raw_query_scores, nei_idx, nei_scores, fill_value):
+    arr = jnp.full_like(raw_query_scores,fill_value=fill_value,dtype=nei_scores.dtype)
+    return put_along_zeroth_axis(arr, nei_idx, nei_scores)
+
+def _flatten_dict_string_keys(params):
+  """Flattens a nested dictionary to have string keys and '/' separators."""
+  return {"/".join(k): v for k, v in flatten_dict(unfreeze(params)).items()}
+def write_parameter_info(tstate):
+    """Write information on state and trainable parameters to the log."""
+
+    # Write information on parameters to log file.
+    params_dict = _flatten_dict_string_keys(tstate.params)
+    total_nparams = 0
+    for (k, v) in params_dict.items():
+      nparams = np.prod(v.shape)
+      total_nparams += nparams
+      logging.info("parameter: %s, shape %s, size %d", k, v.shape, nparams)
+    logging.info("Total parameters: %d", total_nparams)
 
 
 class JaxRNG(object):
@@ -170,6 +244,7 @@ def get_jax_mesh(axis_dims, names):
         physical_mesh = np.array(jax.devices()).reshape(mesh_shape)
     else:
         physical_mesh = mesh_utils.create_device_mesh(mesh_shape)
+        # physical_mesh = mesh_utils.create_device_mesh(mesh_shape,contiguous_submeshes=True)
     return Mesh(physical_mesh, dim_names)
 
 
@@ -265,7 +340,8 @@ def cross_entropy_loss_and_accuracy(logits, tokens, valid=None):
         -1,
     )
     token_log_prob = jnp.where(valid > 0.0, token_log_prob, jnp.array(0.0))
-    loss = -jnp.mean(jnp.sum(token_log_prob, axis=-1) / valid_text_length)
+    # loss = -jnp.mean(jnp.sum(token_log_prob, axis=-1) / valid_text_length)
+    loss = -jnp.sum(token_log_prob)/valid_text_length.sum()
     correct = jnp.where(
         valid > 0.0,
         jnp.argmax(logits, axis=-1) == tokens,

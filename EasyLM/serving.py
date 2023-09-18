@@ -23,9 +23,12 @@ from requests.exceptions import Timeout, ConnectionError
 
 class InferenceRequest(BaseModel):
     prefix_text: Optional[List[str]] = None
+    prompt: Optional[str] = None
+    memory_str: Optional[str] = None
     text: Optional[List[str]] = None
     until: Optional[Union[List[str], List[List[str]]]] = None
     temperature: Optional[float] = None
+    max_new_tokens: int = 128
 
 
 class ChatRequest(BaseModel):
@@ -66,17 +69,18 @@ class LMServer(object):
         self.config = self.get_default_config(config)
         self.lock = Lock()
         self.app = FastAPI()
-        self.app.post('/loglikelihood')(self.serve_loglikelihood)
+        print(f"{self.config.host=}, {self.config.port=}")
+        # self.app.post('/loglikelihood')(self.serve_loglikelihood)
         self.app.post('/loglikelihood-rolling')(self.serve_loglikelihood_rolling)
         self.app.post('/generate')(self.serve_generate)
-        self.app.post('/greedy-until')(self.serve_greedy_until)
+        # self.app.post('/greedy-until')(self.serve_greedy_until)
         self.app.post('/chat')(self.serve_chat)
         self.app.get('/ready')(self.serve_ready)
         self.app = gr.mount_gradio_app(self.app, self.create_chat_app(), '/')
 
-    @staticmethod
-    def loglikelihood(prefix_text, text):
-        raise NotImplementedError()
+    # @staticmethod
+    # def loglikelihood(prefix_text, text):
+    #     raise NotImplementedError()
 
     @staticmethod
     def loglikelihood_rolling(text):
@@ -86,9 +90,9 @@ class LMServer(object):
     def generate(text, temperature):
         raise NotImplementedError()
 
-    @staticmethod
-    def greedy_until(prefix_text, until, max_length):
-        raise NotImplementedError()
+    # @staticmethod
+    # def greedy_until(prefix_text, until, max_length):
+    #     raise NotImplementedError()
 
     @staticmethod
     def to_list(x):
@@ -99,59 +103,59 @@ class LMServer(object):
     def serve_ready(self):
         return 'Ready!\n'
 
-    def serve_loglikelihood(self, data: InferenceRequest):
-        with self.lock:
-            if self.config.logging:
-                absl.logging.info(
-                    '\n========= Serving Log Likelihood Request ========= \n'
-                    + pprint.pformat(data) + '\n'
-                )
+    # def serve_loglikelihood(self, data: InferenceRequest):
+    #     with self.lock:
+    #         if self.config.logging:
+    #             absl.logging.info(
+    #                 '\n========= Serving Log Likelihood Request ========= \n'
+    #                 + pprint.pformat(data) + '\n'
+    #             )
 
-            if data.prefix_text is None:
-                data.prefix_text = ['' for _ in data.text]
+    #         if data.prefix_text is None:
+    #             data.prefix_text = ['' for _ in data.text]
 
-            prefix_text = [
-                self.config.prepend_to_prefix + p + self.config.append_to_prefix
-                for p in data.prefix_text
-            ]
-            text = [
-                self.config.prepend_to_text + t + self.config.append_to_text
-                for t in data.text
-            ]
+    #         prefix_text = [
+    #             self.config.prepend_to_prefix + p + self.config.append_to_prefix
+    #             for p in data.prefix_text
+    #         ]
+    #         text = [
+    #             self.config.prepend_to_text + t + self.config.append_to_text
+    #             for t in data.text
+    #         ]
 
-            log_likelihood = []
-            is_greedy = []
-            for i in trange(0, len(text), self.config.batch_size, ncols=0):
-                batch_prefix_text = prefix_text[i:i + self.config.batch_size]
-                batch_text = text[i:i + self.config.batch_size]
-                batch_size = len(batch_text)
+    #         log_likelihood = []
+    #         is_greedy = []
+    #         for i in trange(0, len(text), self.config.batch_size, ncols=0):
+    #             batch_prefix_text = prefix_text[i:i + self.config.batch_size]
+    #             batch_text = text[i:i + self.config.batch_size]
+    #             batch_size = len(batch_text)
 
-                if batch_size < self.config.batch_size:
-                    extra = self.config.batch_size - batch_size
-                    batch_prefix_text.extend(['a' for _ in range(extra)])
-                    batch_text.extend(['a' for _ in range(extra)])
+    #             if batch_size < self.config.batch_size:
+    #                 extra = self.config.batch_size - batch_size
+    #                 batch_prefix_text.extend(['a' for _ in range(extra)])
+    #                 batch_text.extend(['a' for _ in range(extra)])
 
-                batch_log_likelihood, batch_is_greedy = self.loglikelihood(
-                    batch_prefix_text, batch_text
-                )
-                batch_log_likelihood = self.to_list(batch_log_likelihood)
-                batch_is_greedy = self.to_list(batch_is_greedy)
-                log_likelihood.extend(batch_log_likelihood[:batch_size])
-                is_greedy.extend(batch_is_greedy[:batch_size])
+    #             batch_log_likelihood, batch_is_greedy = self.loglikelihood(
+    #                 batch_prefix_text, batch_text
+    #             )
+    #             batch_log_likelihood = self.to_list(batch_log_likelihood)
+    #             batch_is_greedy = self.to_list(batch_is_greedy)
+    #             log_likelihood.extend(batch_log_likelihood[:batch_size])
+    #             is_greedy.extend(batch_is_greedy[:batch_size])
 
-            output = {
-                'prefix_text': data.prefix_text,
-                'text': data.text,
-                'log_likelihood': log_likelihood,
-                'is_greedy': is_greedy,
-            }
-            if self.config.logging:
-                absl.logging.info(
-                '\n========= Output ========= \n'
-                + pprint.pformat(output) + '\n'
-            )
+    #         output = {
+    #             'prefix_text': data.prefix_text,
+    #             'text': data.text,
+    #             'log_likelihood': log_likelihood,
+    #             'is_greedy': is_greedy,
+    #         }
+    #         if self.config.logging:
+    #             absl.logging.info(
+    #             '\n========= Output ========= \n'
+    #             + pprint.pformat(output) + '\n'
+    #         )
 
-        return output
+    #     return output
 
     def serve_loglikelihood_rolling(self, data: InferenceRequest):
         with self.lock:
@@ -167,6 +171,7 @@ class LMServer(object):
             ]
             log_likelihood = []
             is_greedy = []
+            token_count = []
             for i in trange(0, len(text), self.config.batch_size, ncols=0):
                 batch_text = text[i:i + self.config.batch_size]
                 batch_size = len(batch_text)
@@ -175,18 +180,22 @@ class LMServer(object):
                     extra = self.config.batch_size - batch_size
                     batch_text.extend(['a' for _ in range(extra)])
 
-                batch_log_likelihood, batch_is_greedy = self.loglikelihood_rolling(
+                batch_log_likelihood, batch_is_greedy, batch_token_count = self.loglikelihood_rolling(
                     batch_text
                 )
                 batch_log_likelihood = self.to_list(batch_log_likelihood)
                 batch_is_greedy = self.to_list(batch_is_greedy)
+                batch_token_count = self.to_list(batch_token_count)
                 log_likelihood.extend(batch_log_likelihood[:batch_size])
                 is_greedy.extend(batch_is_greedy[:batch_size])
+                token_count.extend(batch_token_count[:batch_size])
+                
 
             output = {
                 'text': data.text,
                 'log_likelihood': log_likelihood,
                 'is_greedy': is_greedy,
+                "token_count": token_count,
             }
             if self.config.logging:
                 absl.logging.info(
@@ -222,7 +231,11 @@ class LMServer(object):
 
                 batch_output_text = self.generate(
                     batch_prefix_text,
+                    prompt=data.prompt,
+                    memory_str=data.memory_str,
                     temperature=data.temperature,
+                    max_new_tokens=data.max_new_tokens
+                    
                 )
                 output_text.extend(self.to_list(batch_output_text)[:batch_size])
 
@@ -238,41 +251,41 @@ class LMServer(object):
                 )
         return output
 
-    def serve_greedy_until(self, data: InferenceRequest):
-        with self.lock:
-            if self.config.logging:
-                absl.logging.info(
-                    '\n========= Serving Greedy Until Request ========= \n'
-                    + pprint.pformat(data) + '\n'
-                )
-            prefix_text = [
-                self.config.prepend_to_prefix + p + self.config.append_to_prefix
-                for p in data.prefix_text
-            ]
-            until = data.until
-            max_length = self.config.greedy_until_max_length
+    # def serve_greedy_until(self, data: InferenceRequest):
+    #     with self.lock:
+    #         if self.config.logging:
+    #             absl.logging.info(
+    #                 '\n========= Serving Greedy Until Request ========= \n'
+    #                 + pprint.pformat(data) + '\n'
+    #             )
+    #         prefix_text = [
+    #             self.config.prepend_to_prefix + p + self.config.append_to_prefix
+    #             for p in data.prefix_text
+    #         ]
+    #         until = data.until
+    #         max_length = self.config.greedy_until_max_length
 
-            output_text = []
-            for i in range(0, len(prefix_text), self.config.batch_size):
-                batch_prefix_text = prefix_text[i:i + self.config.batch_size]
-                batch_until = until[i:i + self.config.batch_size]
-                batch_size = len(batch_prefix_text)
+    #         output_text = []
+    #         for i in range(0, len(prefix_text), self.config.batch_size):
+    #             batch_prefix_text = prefix_text[i:i + self.config.batch_size]
+    #             batch_until = until[i:i + self.config.batch_size]
+    #             batch_size = len(batch_prefix_text)
 
-                batch_output_text = self.greedy_until(batch_prefix_text, batch_until, max_length)
-                output_text.extend(self.to_list(batch_output_text)[:batch_size])
+    #             batch_output_text = self.greedy_until(batch_prefix_text, batch_until, max_length)
+    #             output_text.extend(self.to_list(batch_output_text)[:batch_size])
 
-            output = {
-                'prefix_text': data.prefix_text,
-                'until': data.until,
-                'max_length': max_length,
-                'output_text': output_text,
-            }
-            if self.config.logging:
-                absl.logging.info(
-                    '\n========= Output ========= \n'
-                    + pprint.pformat(output) + '\n'
-                )
-        return output
+    #         output = {
+    #             'prefix_text': data.prefix_text,
+    #             'until': data.until,
+    #             'max_length': max_length,
+    #             'output_text': output_text,
+    #         }
+    #         if self.config.logging:
+    #             absl.logging.info(
+    #                 '\n========= Output ========= \n'
+    #                 + pprint.pformat(output) + '\n'
+    #             )
+    #     return output
 
     def process_chat(self, prompt, context, temperature):
         context = (
@@ -411,21 +424,22 @@ class LMServer(object):
                 pre_compile = self.config.pre_compile.split(',')
 
             pre_compile_data = ['a' for _ in range(self.config.batch_size)]
-            for task in pre_compile:
-                if task == 'loglikelihood':
-                    self.loglikelihood(pre_compile_data, pre_compile_data)
-                    self.loglikelihood_rolling(pre_compile_data)
-                elif task == 'generate':
-                    self.generate(pre_compile_data, 1.0)
-                elif task == 'greedy_until':
-                    self.greedy_until(
-                        pre_compile_data, pre_compile_data,
-                        self.config.greedy_until_max_length
-                    )
-                elif task == 'chat':
-                    self.process_chat('a', 'a', 1.0)
-                else:
-                    raise ValueError(f'Invalid precompile task: {task}!')
+            if not (len(pre_compile)==1 and pre_compile[0]=="none"):
+                for task in pre_compile:
+                    if task == 'loglikelihood':
+                        # self.loglikelihood(pre_compile_data, pre_compile_data)
+                        self.loglikelihood_rolling(pre_compile_data)
+                    elif task == 'generate':
+                        self.generate(pre_compile_data,pre_compile_data[0], 1.0, precompile=True)
+                    # elif task == 'greedy_until':
+                    #     self.greedy_until(
+                    #         pre_compile_data, pre_compile_data,
+                    #         self.config.greedy_until_max_length
+                    #     )
+                    elif task == 'chat':
+                        self.process_chat('a', 'a', 1.0)
+                    else:
+                        raise ValueError(f'Invalid precompile task: {task}!')
 
         uvicorn.run(self.app, host=self.config.host, port=self.config.port)
 
@@ -471,27 +485,27 @@ class LMClient(object):
         if len(batch) > 0:
             yield batch
 
-    def loglikelihood(self, prefix, text):
-        prefix, text = list(prefix), list(text)
-        if self.config.dummy:
-            return [-1.0 for _ in text], [False for _ in text]
+    # def loglikelihood(self, prefix, text):
+    #     prefix, text = list(prefix), list(text)
+    #     if self.config.dummy:
+    #         return [-1.0 for _ in text], [False for _ in text]
 
-        log_likelihood = []
-        is_greedy = []
+    #     log_likelihood = []
+    #     is_greedy = []
 
-        batched_iterator = list(zip(
-            self.batched(prefix, self.config.batch_size),
-            self.batched(text, self.config.batch_size)
-        ))
-        for batch_prefix, batch_text in tqdm(batched_iterator, ncols=0):
-            response = requests.post(
-                urllib.parse.urljoin(self.config.url, 'loglikelihood'),
-                json={'prefix_text': batch_prefix, 'text': batch_text}
-            ).json()
-            log_likelihood.extend(response['log_likelihood'])
-            is_greedy.extend(response['is_greedy'])
+    #     batched_iterator = list(zip(
+    #         self.batched(prefix, self.config.batch_size),
+    #         self.batched(text, self.config.batch_size)
+    #     ))
+    #     for batch_prefix, batch_text in tqdm(batched_iterator, ncols=0):
+    #         response = requests.post(
+    #             urllib.parse.urljoin(self.config.url, 'loglikelihood'),
+    #             json={'prefix_text': batch_prefix, 'text': batch_text}
+    #         ).json()
+    #         log_likelihood.extend(response['log_likelihood'])
+    #         is_greedy.extend(response['is_greedy'])
 
-        return log_likelihood, is_greedy
+    #     return log_likelihood, is_greedy
 
     def loglikelihood_rolling(self, text):
         text = list(text)
@@ -510,31 +524,31 @@ class LMClient(object):
             is_greedy.extend(response['is_greedy'])
         return log_likelihood, is_greedy
 
-    def greedy_until(self, prefix, until):
-        prefix, until = list(prefix), list(until)
-        if self.config.dummy:
-            results = []
-            for u in until:
-                if isinstance(u, str):
-                    results.append('dummy text ' + u)
-                else:
-                    results.append('dummy text ' + u[0])
-            return results
+    # def greedy_until(self, prefix, until):
+    #     prefix, until = list(prefix), list(until)
+    #     if self.config.dummy:
+    #         results = []
+    #         for u in until:
+    #             if isinstance(u, str):
+    #                 results.append('dummy text ' + u)
+    #             else:
+    #                 results.append('dummy text ' + u[0])
+    #         return results
 
-        batched_iterator = list(zip(
-            self.batched(prefix, self.config.batch_size),
-            self.batched(until, self.config.batch_size),
-        ))
-        output_text = []
-        for batch_prefix, batch_until in tqdm(batched_iterator, ncols=0):
-            response = requests.post(
-                urllib.parse.urljoin(self.config.url, 'greedy-until'),
-                json={'prefix_text': batch_prefix, 'until': batch_until}
-            ).json()
-            output_text.extend(response['output_text'])
-        return output_text
+    #     batched_iterator = list(zip(
+    #         self.batched(prefix, self.config.batch_size),
+    #         self.batched(until, self.config.batch_size),
+    #     ))
+    #     output_text = []
+    #     for batch_prefix, batch_until in tqdm(batched_iterator, ncols=0):
+    #         response = requests.post(
+    #             urllib.parse.urljoin(self.config.url, 'greedy-until'),
+    #             json={'prefix_text': batch_prefix, 'until': batch_until}
+    #         ).json()
+    #         output_text.extend(response['output_text'])
+    #     return output_text
 
-    def generate(self, prefix, temperature=None):
+    def generate(self, prefix, prompt, memory_str, max_new_tokens=128, temperature=None):
         prefix = list(prefix)
         if self.config.dummy:
             return ['' for _ in prefix]
@@ -546,7 +560,10 @@ class LMClient(object):
                 urllib.parse.urljoin(self.config.url, 'generate'),
                 json={
                     'prefix_text': batch_prefix,
+                    "prompt": prompt,
+                    "memory_str":memory_str,
                     'temperature': temperature,
+                    "max_new_tokens": max_new_tokens,
                 }
             ).json()
             output_text.extend(response['output_text'])

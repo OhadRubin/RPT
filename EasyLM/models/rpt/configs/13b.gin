@@ -1,0 +1,7 @@
+include "EasyLM/EasyLM/models/rpt/configs/250m.gin"
+
+rpt_model.RPTConfig:
+        hidden_size= 5120
+        intermediate_size= 13824
+        num_hidden_layers= 40
+        num_attention_heads = 40

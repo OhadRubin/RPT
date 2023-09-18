@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import flax.serialization
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.jax_utils import float_to_dtype
+from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
@@ -34,7 +35,8 @@ def main(argv):
         )
     else:
         params = float_to_dtype(params, FLAGS.float_dtype)
-        with mlxu.open_file(FLAGS.output, 'wb') as fout:
+        params = unfreeze(params)
+        with mlxu.open_file(FLAGS.output_file, 'wb') as fout:
             fout.write(flax.serialization.msgpack_serialize(params, in_place=True))
 
 
