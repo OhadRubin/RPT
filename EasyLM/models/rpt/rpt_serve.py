@@ -71,6 +71,67 @@ from flax.linen import combine_masks, make_causal_mask
 from einops import reduce
 
 
+def apply_forward_upcoder(params,
+                          hf_model,
+                          input_tokens,
+                          input_mask,
+                          output_tokens,
+                          output_mask,
+                          upcoder_input
+                          ):
+    outputs, past_key_values = hf_model.module.apply(
+        params, input_tokens, attention_mask=input_mask,
+        upcoder_input=upcoder_input,
+        deterministic=True,
+        mutable=['cache','intermediates']
+    )
+    output = process_logits(output_tokens, output_mask, outputs.logits)
+    past_key_values = unfreeze(past_key_values).get("cache", None)
+    return output, past_key_values
+
+def apply_forward_loglikelihood(params,
+                                hf_model,
+                                input_tokens,
+                                input_mask,
+                                output_tokens,
+                                output_mask,
+                          ):
+    outputs, past_key_values = hf_model.module.apply(
+        params, input_tokens, attention_mask=input_mask,
+        deterministic=True,
+        mutable=['cache']
+    )
+    output = process_logits(output_tokens, output_mask, outputs.logits)
+    past_key_values = unfreeze(past_key_values).get("cache", None)
+
+    return output, past_key_values
+
+def apply_forward_lowcoder(params, hf_model,input_tokens,input_mask, **kwargs):
+    outputs, past_key_values = hf_model.module.apply(
+                params,
+                input_ids=input_tokens,
+                attention_mask=input_mask,
+                deterministic=True,
+                method=hf_model.module._lowcoder_forward,
+                mutable = ["cache"]
+        )
+    past_key_values = unfreeze(past_key_values).get("cache", None)
+    return outputs,past_key_values
+
+def apply_forward_augment(params, hf_model, hidden_states, neighbor_hidden_states, neighbor_mask):
+    outputs, past_key_values = hf_model.module.apply(
+                params,
+                hidden_states=hidden_states,
+                neighbor_hidden_states=neighbor_hidden_states,
+                neighbor_mask=neighbor_mask,
+                deterministic=True,
+                method=hf_model.module._augment_forward,
+                mutable = ["cache"]
+        )
+    past_key_values = unfreeze(past_key_values).get("cache", None)
+    return outputs, past_key_values
+
+
 def filter_(intermediates):
     def cont(k):
         for s in ["layers/0","retriever","/neighbor_"]:
@@ -89,6 +150,19 @@ def postproc_output(tokenizer, output, output_text, verbose=False):
         new_output_text.append(old_text+(text,))
 
     return new_output_text
+
+def process_logits(output_tokens, output_mask, logits):
+    loglikelihood = -optax.softmax_cross_entropy_with_integer_labels(
+        logits, output_tokens
+    )
+    loglikelihood = jnp.sum(loglikelihood * output_mask, axis=-1)
+    match_count = jnp.sum(
+        (jnp.argmax(logits, axis=-1) == output_tokens) * output_mask,
+        axis=-1
+    )
+    total = jnp.sum(output_mask, axis=-1)
+    is_greedy = match_count == total
+    return loglikelihood, is_greedy
 
 def rolling_iterator(tokenizer, text, input_length):
     inputs = tokenizer(
@@ -184,110 +258,30 @@ def main(argv):
         model_ps, get_float_dtype_by_name(FLAGS.dtype)
     )
 
-    
-    @partial(
-        pjit,
-        in_shardings=(model_ps, PS()),
-        out_shardings=(PS(), PS(), PS())
-    )
-    def _forward_loglikelihood(params, batch):
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-
-        input_tokens = batch['input_tokens']
-        input_mask = batch['input_mask']
-        
-        output_tokens = batch['output_tokens']
-        
-        output_mask = batch['output_mask']
-        outputs, state = hf_model.module.apply(
-            params, input_tokens, attention_mask=input_mask,
-            deterministic=True,
-            mutable=['cache','intermediates']
-        )
-        logits = outputs.logits
-        loglikelihood = -optax.softmax_cross_entropy_with_integer_labels(
-            logits, output_tokens
-        )
-        loglikelihood = jnp.sum(loglikelihood * output_mask, axis=-1)
-        match_count = jnp.sum(
-            (jnp.argmax(logits, axis=-1) == output_tokens) * output_mask,
-            axis=-1
-        )
-        total = jnp.sum(output_mask, axis=-1)
-        is_greedy = match_count == total
-        return loglikelihood, is_greedy, unfreeze(state)
-
-    @partial(
+    def pjit_func(func):
+        @partial(
             pjit,
             in_shardings=(model_ps, PS()),
-            out_shardings=PS()
+            out_shardings=(PS(), model_ps['cache'])
         )
-    def _forward_augment(params, batch):
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-        outputs = hf_model.augment_forward(
-            **batch,
-            past_key_values=params.pop("cache",None),
-            params=params['params'],
-        )
-        return outputs
-
-
+        def _inner(params, batch):
+            batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+            outputs, past_key_values = func(params, hf_model, **batch)
+            return outputs, past_key_values
+        return _inner
     
-    @partial(
-            pjit,
-            in_shardings=(model_ps, PS()),
-            out_shardings=(PS(),model_ps['cache'])
-        )
-    def _forward_lowcoder(params, batch):
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-        output, past_key_values, _ = hf_model.lowcoder_forward(
-            batch['input_tokens'],
-            attention_mask=batch['input_mask'],
-            past_key_values=params.pop("cache",None),
-            params=params['params'],
-        )
-        return output, past_key_values
+    _forward_upcoder = pjit_func(apply_forward_upcoder)
+    _forward_loglikelihood = pjit_func(apply_forward_loglikelihood)
+    _forward_lowcoder = pjit_func(apply_forward_lowcoder)
+    _forward_augment = pjit_func(apply_forward_augment)
     
-        
-    @partial(
-        pjit,
-        in_shardings=(model_ps, PS()),
-        out_shardings=(PS(), PS(), model_ps['cache'])
-    )
-    def _forward_upcoder(params, batch):
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-        input_tokens = batch['input_tokens']
-        input_mask = batch['input_mask']
-        
-        output_tokens = batch['output_tokens']
-        output_mask = batch['output_mask']
-        
-        outputs, state = hf_model.module.apply(
-            params, input_tokens, attention_mask=input_mask,
-            upcoder_input=batch['upcoder_input'],
-            deterministic=True,
-            mutable=['cache','intermediates']
-        )
-        logits = outputs.logits
-        loglikelihood = -optax.softmax_cross_entropy_with_integer_labels(
-            logits, output_tokens
-        )
-        loglikelihood = jnp.sum(loglikelihood * output_mask, axis=-1)
-        match_count = jnp.sum(
-            (jnp.argmax(logits, axis=-1) == output_tokens) * output_mask,
-            axis=-1
-        )
-        total = jnp.sum(output_mask, axis=-1)
-        is_greedy = match_count == total
-        return loglikelihood, is_greedy, unfreeze(state['cache'])
-        
 
     def forward_loglikelihood(params, batch, memory):
         if rpt_config.cca_freq==0:
-            *out,state = _forward_loglikelihood(params, batch)
-            if 'cache' in state:
-                params['cache'] = state['cache']
-            return out
+            outputs, past_key_values = _forward_loglikelihood(params, batch)
+            if past_key_values is not None:
+                params.update(cache=past_key_values)
+            return outputs
         else:
             with mesh:
                 outputs, past_key_values = _forward_lowcoder(params, batch)
@@ -307,9 +301,9 @@ def main(argv):
                             neighbor_mask=neighbor_mask
                             )
                 )
-                *output, past_key_values = _forward_upcoder(params, batch)
+                outputs, past_key_values = _forward_upcoder(params, batch)
                 params.update(cache=past_key_values)
-            return  output
+            return  outputs
 
 
     def  create_forward_generate(model_ps, max_new_tokens,is_prefix=False,sample=True):
@@ -505,7 +499,7 @@ def main(argv):
                         neighbor_mask = np.concatenate([prompt_mask,neighbor_mask],axis=1)
                     
                     with mesh:
-                        neighbor_hidden_states, past_key_values, intermediates = _forward_augment(
+                        neighbor_hidden_states, past_key_values = _forward_augment(
                             params, dict(hidden_states=enc_lowcoder_states.original_hidden_states,
                                         neighbor_hidden_states=neighbor_hidden_states,
                                         neighbor_mask=neighbor_mask)

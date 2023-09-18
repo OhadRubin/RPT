@@ -1310,7 +1310,7 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
         # if past_key_values are passed then cache is already initialized a private flag init_cache has to be passed down to ensure cache is used. It has to be made sure that cache is marked as mutable so that it can be changed by FlaxGPTJAttention module
         if past_key_values:
             inputs["cache"] = past_key_values
-            mutable = ["cache","intermediates"]
+            mutable = ["cache"]
         else:
             mutable = False
 
@@ -1353,20 +1353,14 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
         ):
 
         apply_kwargs = self.create_apply_kwargs(params, dropout_rng)
-        def _encode_forward(module, hidden_states, attention_mask, **kwargs):
-            retriever_module = module._get_preret_forward()
-            return retriever_module(
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                **kwargs
-            )
+
             
         outputs = self.module.apply(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 deterministic= not train,
                 output_attentions=output_attentions,
-                method=_encode_forward,
+                method=self.module._encode_forward,
                 **apply_kwargs
         )
 
@@ -1386,18 +1380,6 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
 
         apply_kwargs = self.create_apply_kwargs(params, dropout_rng, past_key_values)
 
-        def _augment_forward(module,
-                             hidden_states,
-                             neighbor_hidden_states,
-                             neighbor_mask,
-                             **kwargs):
-            augment_module = module._get_augment_forward()
-            return augment_module(
-                hidden_states,
-                neighbor_hidden_states,
-                neighbor_mask,
-                **kwargs
-            )
         
         outputs, past_key_values = self.module.apply(
                 hidden_states=hidden_states,
@@ -1405,7 +1387,7 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
                 neighbor_mask=neighbor_mask,
                 deterministic=not train,
                 output_attentions=output_attentions,
-                method=_augment_forward,
+                method=self.module._augment_forward,
                 **apply_kwargs
         )
 
@@ -1425,31 +1407,13 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
         apply_kwargs = self.create_apply_kwargs(params, dropout_rng, past_key_values)
 
 
-        def _lowcoder_forward(module, input_ids, attention_mask, **kwargs):
-            wte_module, lowcoder_module = module._get_lowcoder_forward()
-            retriever_module = module._get_preret_forward()
-            lowcoder_outputs = lowcoder_module(
-                wte_module(input_ids.astype("i4")),
-                attention_mask,
-                **kwargs
-            )
-
-            outputs = retriever_module(
-                hidden_states=lowcoder_outputs.last_hidden_state,
-                attention_mask=attention_mask,
-                **kwargs
-            )
-            return outputs
-        
-        deterministic = not train
         outputs, past_key_values = self.module.apply(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                deterministic=deterministic,
+                deterministic=not train,
                 output_attentions=output_attentions,
-                method=_lowcoder_forward,
-                **apply_kwargs
-                
+                method=self.module._lowcoder_forward,
+                **apply_kwargs       
         )
         return outputs, unfreeze(past_key_values["cache"]), past_key_values.get("intermediates",None)
     
@@ -2428,7 +2392,7 @@ class FlaxRPTRetriever(nn.Module):
                hidden_states,
                attention_mask,
                deterministic,
-               output_attentions):
+               output_attentions: bool = False,):
         original_hidden_states_shape = hidden_states.shape
         original_attention_mask_shape = attention_mask.shape
         
@@ -2695,16 +2659,38 @@ class FlaxRPTForCausalLMModule(nn.Module):
     param_dtype: jnp.dtype=jnp.float32
     precision: Optional[Union[jax.lax.Precision, str]]=None
     
-    def _get_preret_forward(self):
-        return self.transformer.retriever.preret_encode
+    def _encode_forward(self, hidden_states, attention_mask, **kwargs):
+        return self.transformer.retriever.preret_encode(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            **kwargs
+        )
+    def _lowcoder_forward(self, input_ids, attention_mask, **kwargs):
+        lowcoder_outputs = self.transformer.lowcoder(
+            self.transformer.wte(input_ids.astype("i4")),
+            attention_mask,
+            **kwargs
+        )
+
+        outputs = self.transformer.retriever.preret_encode(
+            hidden_states=lowcoder_outputs.last_hidden_state,
+            attention_mask=attention_mask,
+            **kwargs
+        )
+        return outputs
+
+    def _augment_forward(self,
+                        hidden_states,
+                        neighbor_hidden_states,
+                        neighbor_mask,
+                        **kwargs):
+        return self.transformer.upcoder.augment(
+            hidden_states,
+            neighbor_hidden_states,
+            neighbor_mask,
+            **kwargs
+        )
     
-    def _get_lowcoder_forward(self):
-        return self.transformer.wte,self.transformer.lowcoder
-    
-    def _get_augment_forward(self):
-        return self.transformer.upcoder.augment
-    
-        
     
     def setup(self):
         self.transformer = FlaxRPTModule(self.config, dtype=self.dtype)
