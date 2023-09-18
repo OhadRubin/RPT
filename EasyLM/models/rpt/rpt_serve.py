@@ -88,6 +88,9 @@ def prepare_prefix(prefix_tokenizer, text, input_length, add_bos_token):
         input_mask=input_mask.astype(int),
     )
     return batch
+
+
+
 def apply_forward_upcoder(params,
                           hf_model,
                           input_tokens,
@@ -148,6 +151,66 @@ def apply_forward_augment(params, hf_model, hidden_states, neighbor_hidden_state
     past_key_values = unfreeze(past_key_values).get("cache", None)
     return outputs, past_key_values
 
+
+def _loglikelihood_rolling(tokenizer, params, text, func, nearest_chunk_distance,num_neighbors=2,input_length=1024,verbose=True, return_scores=False):
+    memory = Memory(chunk_size=64, num_neighbors=num_neighbors, nearest_chunk_distance=nearest_chunk_distance,return_scores=return_scores)
+    params.update(cache=jax.tree_map(lambda x:jnp.zeros_like(x) ,params['cache']))
+
+    loglikelihood_list = []
+    total_loglikelihood = 0.0
+    total_is_greedy = True
+    metadata_list = tuple()
+    token_count = np.zeros((len(text),), dtype=np.int32)
+    
+    for batch in rolling_iterator(tokenizer, text, input_length):
+        token_count+= batch['output_mask'].sum(-1)
+        
+        (loglikelihood, is_greedy), metadata = func(
+            params, batch, memory
+        )
+        loglikelihood, is_greedy = jax.device_get((loglikelihood, is_greedy))
+        metadata_list += (metadata,)
+        total_loglikelihood += loglikelihood
+        loglikelihood_list.append(loglikelihood.item())
+        total_is_greedy = np.logical_and(is_greedy, total_is_greedy)
+    if verbose:
+        print(loglikelihood_list)
+    return total_loglikelihood, total_is_greedy, token_count, metadata_list
+    
+    
+
+def create_forward_loglikelihood(config, low_fwd, up_fwd, fwd):
+    def forward_loglikelihood_no_mem(params, batch, memory):
+        outputs, past_key_values = fwd(params, batch)
+        if past_key_values is not None:
+            params.update(cache=past_key_values)
+        return outputs, None
+    def forward_loglikelihood_w_mem(params, batch, memory):
+        outputs, past_key_values = low_fwd(params, batch)
+        params.update(cache=past_key_values)
+
+        neighbor_hidden_states, neighbor_mask, metadata,*_ = memory.add(
+                            input_tokens=batch["input_tokens"],
+                            encoded_hidden_states=outputs.encoded_hidden_states,
+                            key_chunks=outputs.key_chunks,
+                            query_chunks=outputs.query_chunks,
+                            )
+        batch.update(
+            upcoder_input=FlaxRPTLowcoderRetrieverEncodedOutput(
+                    hidden_states=outputs.original_hidden_states,
+                    attention_mask=outputs.attention_mask,
+                    neighbor_hidden_states=neighbor_hidden_states,
+                    neighbor_mask=neighbor_mask
+                    )
+        )
+        outputs, past_key_values = up_fwd(params, batch)
+        params.update(cache=past_key_values)
+        return outputs, metadata
+    if config.cca_freq==0:
+        return forward_loglikelihood_no_mem
+    else:
+        return forward_loglikelihood_w_mem
+    
 
 def filter_(intermediates):
     def cont(k):
@@ -215,6 +278,7 @@ def rolling_iterator(tokenizer, text, input_length):
     # Sliding window
     for i in tqdm.tqdm(range(0, total_input_length, input_length)):
         # Last window
+        #TODO: there is a bug here, for ABC, the last window should be BC, not C0 not BC with B padded.
         if i + input_length > total_input_length:
             last_output_mask = np.copy(attention_mask[:, -input_length:])
             last_output_mask[:, :i - total_input_length] = 0.0
@@ -291,36 +355,11 @@ def main(argv):
     _forward_loglikelihood = pjit_func(apply_forward_loglikelihood)
     _forward_lowcoder = pjit_func(apply_forward_lowcoder)
     _forward_augment = pjit_func(apply_forward_augment)
-    
+        
+    forward_loglikelihood =  create_forward_loglikelihood(rpt_config, _forward_lowcoder, _forward_upcoder, _forward_loglikelihood)
+        
+            
 
-    def forward_loglikelihood(params, batch, memory):
-        if rpt_config.cca_freq==0:
-            outputs, past_key_values = _forward_loglikelihood(params, batch)
-            if past_key_values is not None:
-                params.update(cache=past_key_values)
-            return outputs
-        else:
-            with mesh:
-                outputs, past_key_values = _forward_lowcoder(params, batch)
-                params.update(cache=past_key_values)
-
-                neighbor_hidden_states, neighbor_mask, *_ = memory.add(
-                                    input_tokens=batch["input_tokens"],
-                                    encoded_hidden_states=outputs.encoded_hidden_states,
-                                    key_chunks=outputs.key_chunks,
-                                    query_chunks=outputs.query_chunks,
-                                    )
-                batch.update(
-                    upcoder_input=FlaxRPTLowcoderRetrieverEncodedOutput(
-                            hidden_states=outputs.original_hidden_states,
-                            attention_mask=outputs.attention_mask,
-                            neighbor_hidden_states=neighbor_hidden_states,
-                            neighbor_mask=neighbor_mask
-                            )
-                )
-                outputs, past_key_values = _forward_upcoder(params, batch)
-                params.update(cache=past_key_values)
-            return  outputs
 
 
     def  create_forward_generate(model_ps, max_new_tokens,is_prefix=False,sample=True):
@@ -387,30 +426,15 @@ def main(argv):
         sharded_rng = next_rng()
     class ModelServer(LMServer):
         
-
         @staticmethod
         def loglikelihood_rolling(text):
-            memory = Memory(chunk_size=64, num_neighbors=2, nearest_chunk_distance=FLAGS.nearest_chunk_distance)
-            params.update(cache=jax.tree_map(lambda x:jnp.zeros_like(x) ,params['cache']))
-
-            loglikelihood_list = []
-            total_loglikelihood = 0.0
-            total_is_greedy = True
-            token_count = np.zeros((len(text),), dtype=np.int32)
-            
-            for batch in rolling_iterator(tokenizer, text, FLAGS.input_length):
-                token_count+= batch['output_mask'].sum(-1)
-                with mesh:
-                    loglikelihood, is_greedy = forward_loglikelihood(
-                        params, batch, memory
-                    )
-                    loglikelihood, is_greedy = jax.device_get((loglikelihood, is_greedy))
-                total_loglikelihood += loglikelihood
-                loglikelihood_list.append(loglikelihood.item())
-                total_is_greedy = np.logical_and(is_greedy, total_is_greedy)
-            print(loglikelihood_list)
-
-            return total_loglikelihood, total_is_greedy, token_count
+            with mesh:
+                *output, _ = _loglikelihood_rolling(tokenizer, params, text,
+                                                func=forward_loglikelihood,
+                                                nearest_chunk_distance=FLAGS.nearest_chunk_distance,
+                                                input_length=FLAGS.input_length,
+                                                )
+            return output
         
         @staticmethod
         def lowcoder_rolling(text,num_neighbors=2, wipe_cache=False,nearest_chunk_distance=None):
