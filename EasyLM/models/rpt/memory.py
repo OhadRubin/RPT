@@ -76,7 +76,7 @@ class Memory:
           self.bm25 = BM25(input_tokens)
         self.clip_memory()
 
-    return neighbor_hidden_states, neighbor_mask, metadata, ret_metrics
+    return np.squeeze(neighbor_hidden_states), np.squeeze(neighbor_mask), metadata, ret_metrics
   
   def get_chunk_scores(self, query_chunks, input_tokens):
       if self.is_dense:

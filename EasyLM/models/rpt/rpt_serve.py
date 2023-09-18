@@ -70,7 +70,24 @@ import numpy as np
 from flax.linen import combine_masks, make_causal_mask
 from einops import reduce
 
-
+def prepare_prefix(prefix_tokenizer, text, input_length, add_bos_token):
+    inputs = prefix_tokenizer(
+        text,
+        padding='max_length',
+        truncation=True,
+        max_length=input_length,
+        return_tensors='np',
+    )
+    input_tokens = inputs.input_ids
+    input_mask = inputs.attention_mask
+    if add_bos_token:
+        input_tokens[:, 0] = prefix_tokenizer.bos_token_id
+        input_mask[:, 0] = 1
+    batch = dict(
+        input_tokens=input_tokens.astype(int),
+        input_mask=input_mask.astype(int),
+    )
+    return batch
 def apply_forward_upcoder(params,
                           hf_model,
                           input_tokens,
@@ -440,6 +457,7 @@ def main(argv):
 
         @staticmethod
         def generate(text, temperature, memory_str=None, prompt=None, max_new_tokens=64, precompile=False):
+            batch_size = len(text)
             n_turns = max(max_new_tokens//rpt_config.chunk_size, 1) if not precompile else 2
             if prompt is not None:
                 prompt_vector, prompt_mask = ModelServer.lowcoder_single(prompt)
@@ -450,23 +468,8 @@ def main(argv):
             else:
                 memory = Memory(chunk_size=64, num_neighbors=FLAGS.num_neighbors, nearest_chunk_distance=0, is_dense=FLAGS.dense_mem)
             
-            nonlocal sharded_rng 
-            inputs = prefix_tokenizer(
-                text,
-                padding='max_length',
-                truncation=True,
-                max_length=FLAGS.input_length,
-                return_tensors='np',
-            )
-            input_tokens = inputs.input_ids
-            input_mask = inputs.attention_mask
-            if FLAGS.add_bos_token:
-                input_tokens[:, 0] = tokenizer.bos_token_id
-                input_mask[:, 0] = 1
-            batch = dict(
-                input_tokens=input_tokens.astype(int),
-                input_mask=input_mask.astype(int),
-            )
+            nonlocal sharded_rng             
+            batch = prepare_prefix(prefix_tokenizer, text, FLAGS.input_length, FLAGS.add_bos_token)
             with mesh:
                 outputs, past_key_values = _forward_lowcoder(params, batch)
                 params.update(cache=past_key_values)
@@ -478,7 +481,7 @@ def main(argv):
                                     append=False,
                                     )
             
-            output_text = [tuple() for _ in range(input_tokens.shape[0])]
+            output_text = [tuple() for _ in range(batch_size)]
             
             params.pop("cache")
             output = None 
