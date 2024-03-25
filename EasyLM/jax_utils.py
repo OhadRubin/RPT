@@ -1,9 +1,5 @@
-import os
-import math
-from typing import Any, Mapping, Text, Tuple, Union, NamedTuple
 from functools import partial
 import re
-import dataclasses
 import random
 from ml_collections import ConfigDict
 from ml_collections.config_dict.config_dict import placeholder
@@ -14,7 +10,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as PS
 from jax.sharding import Mesh
 from jax.experimental import mesh_utils
-from jax.experimental.pjit import with_sharding_constraint as _with_sharding_constraint
+from jax.lax import with_sharding_constraint as _with_sharding_constraint
 from jax.experimental.pjit import pjit
 from jax.interpreters import pxla
 import numpy as np
@@ -34,7 +30,7 @@ from einops import reduce
 def print_attention_from_intermediates(intermediates,pat="attn_weights",has_null=True,factor=16):
     assert has_null
     intermediates = jax.device_get(intermediates)
-    for key, value in flatten_tree(intermediates,sep="/").items():
+    for key, value in flatten_tree(intermediates, sep="/").items():
         if pat in key:
             value = value[0][0]
             if has_null:

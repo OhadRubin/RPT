@@ -1,8 +1,5 @@
-import os
-from shutil import copyfile
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, Tuple, Union
 import json
-import tempfile
 
 
 import numpy as np
@@ -18,37 +15,29 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.linen import partitioning as nn_partitioning
 import einops
 
-import sentencepiece as spm
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
-from transformers.tokenization_utils import PreTrainedTokenizer
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSeq2SeqModelOutput,FlaxSeq2SeqLMOutput,ModelOutput
-from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
-from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging
-from flax.linen.dtypes import promote_dtype
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput
+from transformers.modeling_flax_utils import FlaxPreTrainedModel
+from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward
 from ml_collections import ConfigDict
-from ml_collections.config_dict import config_dict
 from mlxu import function_args_to_config, load_pickle, open_file
 
 from EasyLM.memory_efficient_attention import dot_product_attention_multihead as efficient_dot_product_attention
 from EasyLM.jax_utils import (
-    with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy,put_along_zeroth_axis, create_target_scores,add_process_dim,remove_process_dim
+    get_jax_mesh, get_gradient_checkpoint_policy, create_target_scores, add_process_dim, remove_process_dim
 )
 from einops import rearrange
 import flax
 import gin
-from functools import partial
-from jax.experimental.shard_map import shard_map
-from absl import logging
+
 from collections import namedtuple
 import optax
 import rax
 import operator
-from typing import Any, Callable, Optional, Sequence, TypeVar
+from typing import Optional
 from transformers.utils import ModelOutput
 from transformers import AutoTokenizer
-import copy
-RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])    
+RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])
 # EncodedNeighbors = namedtuple('EncodedNeighbors', ['neighbor_hidden_states', 'neighbor_mask',"retriever_input"])    
 EncodedNeighbors = namedtuple('EncodedNeighbors', ['neighbor_hidden_states', 'neighbor_mask',"chunk_index"])    
 # from flax.struct import PyTreeNode

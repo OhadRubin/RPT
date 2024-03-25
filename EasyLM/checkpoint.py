@@ -1,9 +1,9 @@
 import os
-import numpy as np
+import sys
+
 from ml_collections import ConfigDict
 import mlxu
 import jax
-import jax.numpy as jnp
 import flax
 from flax.serialization import (
     from_bytes, to_bytes, to_state_dict, from_state_dict
@@ -103,7 +103,7 @@ class StreamingCheckpointer(object):
         flattend_train_state = {}
         with mlxu.open_file(path) as fin:
             # 83886080 bytes = 80 MB, which is 16 blocks on GCS
-            unpacker = msgpack.Unpacker(fin, read_size=83886080, max_buffer_size=0)
+            unpacker = msgpack.Unpacker(fin, read_size=83886080, max_buffer_size=sys.maxsize)
             for key, value in unpacker:
                 key = tuple(key)
                 if remove_dict_prefix is not None:
@@ -139,7 +139,7 @@ class StreamingCheckpointer(object):
         with mlxu.open_file(path, "rb") as fin:
             encoded_bytes = fin.read()
 
-        state_dict = flax.serialization.msgpack_restore(encoded_bytes)
+        state_dict = msgpack_restore(encoded_bytes)
         if shard_fns is not None:
             shard_fns = to_state_dict(shard_fns)
             state_dict = tree_apply(shard_fns, state_dict)
@@ -210,3 +210,22 @@ class StreamingCheckpointer(object):
             raise ValueError(f'Invalid load_from type: {load_type}')
 
         return train_state, restored_params
+
+
+def msgpack_restore(encoded_pytree: bytes):
+  """Restore data structure from bytes in msgpack format.
+
+  Low-level function that only supports python trees with array leaves,
+  for custom objects use ``from_bytes``.
+
+  Args:
+    encoded_pytree: msgpack-encoded bytes of python tree.
+
+  Returns:
+    Python tree of dict, list, tuple with python primitive
+    and array leaves.
+  """
+  state_dict = msgpack.unpackb(
+    encoded_pytree, ext_hook=flax.serialization._msgpack_ext_unpack, raw=False, max_buffer_size=2**64
+  )
+  return flax.serialization._unchunk_array_leaves_in_place(state_dict)
