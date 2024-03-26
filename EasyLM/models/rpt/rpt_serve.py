@@ -500,6 +500,8 @@ def main(argv):
             nonlocal sharded_rng
             batch = prepare_prefix(prefix_tokenizer, text, FLAGS.input_length, FLAGS.add_bos_token)
             with mesh:
+                # TOOD: investigate this:
+                # Flax RPT Retriver Encoded output
                 outputs, past_key_values = _forward_lowcoder(params, batch)
                 params.update(cache=past_key_values)
             neighbor_hidden_states, neighbor_mask, *_ = memory.add(

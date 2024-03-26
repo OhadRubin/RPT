@@ -521,6 +521,9 @@ remat = nn_partitioning.remat
 
 
 class FlaxRPTRMSNorm(nn.Module):
+    """
+    RMS normalization layer
+    """
     config: RPTConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -662,6 +665,9 @@ def repeat_kv(hidden_states, n_rep: int):
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 class FlaxRPTAttention(nn.Module):
+    """
+    The transformer's masked self attention layer
+    """
     config: RPTConfig
     dtype: jnp.dtype=jnp.float32
     param_dtype: jnp.dtype=jnp.float32
@@ -711,11 +717,13 @@ class FlaxRPTAttention(nn.Module):
 
         # self.resid_dropout = nn.Dropout(rate=config.resid_pdrop,broadcast_dims=(0,))
 
+        # TODO: Bruh mask (not actually masking anything)
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_sequence_length), dtype="bool"), dtype="bool")
         if self.config.rot_dim is not None and self.config.rot_dim>0:
             rot_dim = self.config.rot_dim
         else:
             rot_dim = self.head_dim
+        # E: positional encoding
         self.freqs_cis = precompute_freqs_cis(
             rot_dim,
             config.max_sequence_length * 2,
@@ -1536,6 +1544,9 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
     
 
 class FlaxRPTLowcoderLayer(nn.Module):
+    """
+
+    """
     config: RPTConfig
     dtype: jnp.dtype=jnp.float32
     param_dtype: jnp.dtype=jnp.float32
@@ -1544,6 +1555,7 @@ class FlaxRPTLowcoderLayer(nn.Module):
     def setup(self) -> None:
         attention_module = FlaxRPTAttention
         if self.config.remat_attention != '':
+            # E: repeat function a ton of times for some reason
             attention_module = remat(
                 FlaxRPTAttention, static_argnums=(3, 4, 5,-1),
                 policy=get_gradient_checkpoint_policy(self.config.remat_attention)
@@ -1581,6 +1593,7 @@ class FlaxRPTLowcoderLayer(nn.Module):
         output_attentions: bool = False,
         fcm_mask: Optional[jnp.ndarray] = None,
     ):
+        # run self attention on the hidden states
         attn_outputs = self.attention(
             self.attention_norm(hidden_states),
             attention_mask,
@@ -1591,11 +1604,16 @@ class FlaxRPTLowcoderLayer(nn.Module):
             fcm_mask,
             sliding_window=self.config.sliding_window,
         )
+
+        # what's on attn output[0]?
         attn_output = attn_outputs[0]
+        # TODO: E: add the attention outputs to the hidden states??
         hidden_states = hidden_states + attn_output
 
+        # nomalize hidden states
         feed_forward_input = self.ffn_norm(hidden_states)
 
+        # run the nomlaized hidden states into the MLP
         if self.config.scan_mlp:
             feed_forward_input = einops.rearrange(
                 feed_forward_input,
@@ -1625,13 +1643,18 @@ class FlaxRPTLowcoderLayer(nn.Module):
                 deterministic,
             )
 
+        # E: Add the goddamn linear layer output to the hidden states?
         hidden_states = hidden_states + feed_forward_hidden_states
 
+        # what's on attn_output[1:]??
         return (hidden_states,) + attn_outputs[1:]
 
     
 
 class FlaxRPTLowcoderLayerCollection(nn.Module):
+    """
+    Basic series of masked attention encoders
+    """
     config: RPTConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype=jnp.float32
@@ -1704,9 +1727,12 @@ class FlaxRPTLowcoderLayerCollection(nn.Module):
 
 
 class FlaxRPTLowcoder(nn.Module):
+    """
+    Just a bunch of attention layers
+    """
     config: RPTConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype=jnp.float32
+    dtype: jnp.dtype = jnp.float32 # type of embedding
+    param_dtype: jnp.dtype=jnp.float32 # type of input
     precision: Optional[Union[jax.lax.Precision, str]]=None
 
     def setup(self):        
@@ -2163,6 +2189,9 @@ class FlaxRPTCrossNeighborAugmentor(nn.Module):
         return (neighbor_hidden_states,) + cross_neig_out[1:]
 
 class FlaxRPTUpcoder(nn.Module):
+    """
+
+    """
     config: RPTConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype=jnp.float32
@@ -2494,15 +2523,21 @@ class FlaxRPTModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]]=None
 
     def setup(self):
+        # the embedding dim
         self.embed_dim = self.config.hidden_size
+
         #TODO: move this wte and dropout into the lowcoder.
+
+        # define a dropout layer
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
+
+        # word to embedding module (layer)
         self.wte = nn.Embed(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            embedding_init=dense_init(self.config, is_embedding=True),
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
+            self.config.vocab_size, # input size
+            self.config.hidden_size, # embedding size
+            embedding_init=dense_init(self.config, is_embedding=True), # basically np.random of weights in the correct size
+            dtype=self.dtype, # type of embedding vector entries
+            param_dtype=self.param_dtype, # type of input
         )
         
         self.lowcoder = FlaxRPTLowcoder(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
@@ -2655,6 +2690,9 @@ class FlaxRPTForCausalLMModule(nn.Module):
             **kwargs
         )
     def _lowcoder_forward(self, input_ids, attention_mask, **kwargs):
+        """
+
+        """
         lowcoder_outputs = self.transformer.lowcoder(
             self.transformer.wte(input_ids.astype("i4")),
             attention_mask,

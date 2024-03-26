@@ -6,6 +6,8 @@ import math
 import numpy as np
 from multiprocessing import Pool, cpu_count
 
+import pandas as pd
+
 """
 All of these algorithms have been taken from the paper:
 Trotmam et al, Improvements to BM25 and Language Models Examined
@@ -25,8 +27,8 @@ class Memory:
                oracle=False) -> None:
     self.chunk_size = chunk_size
     self.num_neighbors = num_neighbors
-    self.values_memory =  None
-    self.keys_memory  = None
+    self.values_memory = None
+    self.keys_memory = None
     self.bm25 = None
     self.is_dense = is_dense
     self.max_size = max_size
@@ -35,30 +37,34 @@ class Memory:
     self.return_scores = return_scores
     self.oracle = oracle
     self.targets = []
-    
-    
-  def set_scores(self,nei_scores,chunk_info):
+
+  def set_scores(self, nei_scores, chunk_info):
     self.score_matrix = reshape_scores(nei_scores, chunk_info)
   
   def add(self, input_tokens, append=True, **kwargs):
+    # converts the elements in kwargs to np.float32
     kwargs = jax.tree_map(lambda x: jax.device_get(x).astype(np.float32), kwargs)
-    return self._add(input_tokens,append=append, **kwargs)
+    return self._add(input_tokens, append=append, **kwargs)
 
-  def _add(self, input_tokens, encoded_hidden_states, key_chunks=None, query_chunks=None,append=True):
-    
+  def _add(self, input_tokens, encoded_hidden_states, key_chunks=None, query_chunks=None, append=True):
     ret_metrics = None
     num_neighbors = self.num_neighbors
-    curr_chunks, _, emb_dim  = encoded_hidden_states.shape
-    input_tokens = list(input_tokens.reshape([-1,self.chunk_size]))
+
+    # TODO: What is this encoded hidden state? 3D vector (curr_chunks = 16?, _? seems to be the window size 64, embedding_dim makes sense)
+    curr_chunks, _, emb_dim = encoded_hidden_states.shape
+    # reshape input token ta column vector
+    input_tokens = list(input_tokens.reshape([-1, self.chunk_size]))
     
-    metadata={}
+    metadata = {}
     
     if self.memory_size() > (self.nearest_chunk_distance+self.num_neighbors):
       chunk_scores = self.get_chunk_scores(query_chunks, input_tokens)
       neighbor_hidden_states, ret_metrics =  self.get_nei(chunk_scores, metadata)
       neighbor_mask = np.ones((curr_chunks,num_neighbors,2*self.chunk_size), dtype=bool)
     else:
+      # a (curr_chunks = 16, num_neighbors = 2, 2*chunk_size=128) array of False
       neighbor_mask = np.zeros((curr_chunks,num_neighbors,2*self.chunk_size), dtype=bool)
+      # a (curr_chunks = 16, num_neighbors = 2, 2*chunk_size=128, embedding_dim=2048) of 0
       neighbor_hidden_states = np.zeros((curr_chunks, num_neighbors, 2*self.chunk_size, emb_dim), dtype=np.float32)
     if append:
       self.targets.extend(input_tokens)
