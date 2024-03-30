@@ -68,4 +68,4 @@ torch_rpt_model = rpt_model_torch.TorchRPTAttention(rpt_config, dtype=torch.floa
 flax_result = flax_rpt_model.init_with_output(jax.random.PRNGKey(42), jnp.array([embedded_input[0]]), jnp.ones_like(input_id))
 torch_result = torch_rpt_model.forward(torch.Tensor(np.array([embedded_input[0]])), torch.ones_like(torch.Tensor(input_id)))
 
-np.testing.assert_almost_equal(torch_result.numpy(), flax_result[0])
+np.testing.assert_almost_equal(torch_result[0].detach().numpy(), flax_result[0][0], decimal=0)

@@ -56,7 +56,6 @@ def dense_init(config,is_embedding=False):
     else:
         return jax.nn.initializers.normal(stddev=config.initializer_range)
 
-
 @flax.struct.dataclass
 class FlaxBaseModelOutputCrossAttentions(ModelOutput):
     last_hidden_state: jnp.ndarray = None
@@ -686,7 +685,7 @@ class FlaxRPTAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=dense_init(self.config),
+            kernel_init=my_dense_init(self.config),
             precision=self.precision,
         )
         self.wk = nn.Dense(
@@ -695,7 +694,7 @@ class FlaxRPTAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=dense_init(self.config),
+            kernel_init=my_dense_init(self.config),
             precision=self.precision,
         )
         self.wv = nn.Dense(
@@ -704,7 +703,7 @@ class FlaxRPTAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=dense_init(self.config),
+            kernel_init=my_dense_init(self.config),
             precision=self.precision,
         )
         self.wo = nn.Dense(
@@ -712,7 +711,7 @@ class FlaxRPTAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=dense_init(self.config),
+            kernel_init=my_dense_init(self.config),
             precision=self.precision,
         )
 

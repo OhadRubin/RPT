@@ -399,36 +399,37 @@ class TorchRPTAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
-        # TODO: Use the initialization function
-        self.wq = torch.nn.Parameter(
-            torch.ones(
-                self.embed_dim,
-                config.num_attention_heads * self.head_dim,
-                dtype=self.dtype)
+        # TODO: DEVICE!!!
+        self.wq = torch.nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
         )
 
-        self.wk = torch.nn.Parameter(
-            torch.rand(
-                self.embed_dim,
-                config.num_attention_heads * self.head_dim,
-                dtype=self.dtype)
-        )
-        self.wv = torch.nn.Parameter(
-            torch.rand(
-                self.embed_dim,
-                config.num_key_value_heads * self.head_dim,
-                dtype=self.dtype)
+        self.wk = torch.nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
         )
 
-        self.wo = torch.nn.Parameter(
-            torch.rand(
-                self.embed_dim,
-                config.hidden_size, dtype=self.dtype)
+        self.wv = torch.nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
+        )
+
+        self.wo = torch.nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
         )
 
         # self.resid_dropout = nn.Dropout(rate=config.resid_pdrop,broadcast_dims=(0,))
 
-        # TODO: Bruh mask (not actually masking anything)
         self.causal_mask = make_causal_mask(torch.ones((1, config.max_sequence_length), dtype=torch.bool), dtype=torch.bool)
         if self.config.rot_dim is not None and self.config.rot_dim > 0:
             rot_dim = self.config.rot_dim
@@ -478,8 +479,7 @@ class TorchRPTAttention(nn.Module):
         # input_embeddings = (len, d)
         # input_embeddings * Wq.T = (Wq x input_embeddings.T).T
 
-        # TODO: let's figure this out
-        xq, xk, xv = self.wq.matmul(hidden_states_for_mult).permute((0, 2, 1)), self.wk.matmul(hidden_states_for_mult).permute((0, 2, 1)), self.wv.matmul(hidden_states_for_mult).permute((0, 2, 1))
+        xq, xk, xv = self.wq.forward(hidden_states), self.wk.forward(hidden_states), self.wv.forward(hidden_states)
 
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
@@ -622,7 +622,7 @@ class TorchRPTAttention(nn.Module):
                                         'b s l ... -> b (s l) ...', s=n_windows)
 
         attn_output = self._merge_heads(attn_output)
-        attn_output = self.wo.matmul(attn_output.permute((0, 2, 1))).permute((0, 2, 1))
+        attn_output = self.wo.forward(attn_output)
         # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
         return outputs
