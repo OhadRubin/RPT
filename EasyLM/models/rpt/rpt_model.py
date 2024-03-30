@@ -576,7 +576,6 @@ def apply_rotary_emb_(
     dtype: jnp.dtype=jnp.float32,
     freqs_cis_k: jnp.ndarray = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-
     reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
     reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
 
@@ -584,8 +583,10 @@ def apply_rotary_emb_(
     xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
 
     # add head dim
+    # freqs_cis = (1, 1024, 64)
     freqs_cis = jnp.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
 
+    # freqs_cis = (1, 1024, 1, 64)
     xq_out = xq_ * freqs_cis
     xq_out = jnp.stack((jnp.real(xq_out), jnp.imag(xq_out)), axis=-1).reshape(*xq_out.shape[:-1], -1)
     if freqs_cis_k is None:
@@ -735,9 +736,19 @@ class FlaxRPTAttention(nn.Module):
 
     @jax.profiler.annotate_function
     def _split_heads(self, hidden_states):
+        """
+        Split the hidden states (1, 1024, 4096) = (1, input_length, embedding_length)
+        into 32 heads with 128 dims each. i.e each token embedding is broken into 32 token embeddings for 32 heads.
+        [
+            [ token 0 embedding "block", token 1 embedding "block", ..., token 1023 embedding "block"]
+        ]
+        """
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
     @jax.profiler.annotate_function
     def _merge_heads(self, hidden_states):
+        """
+        Merge the 32 embeddings back into a singular embeddings (i.e concatenation)
+        """
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
     
 
@@ -825,7 +836,7 @@ class FlaxRPTAttention(nn.Module):
         n_windows=self.config.n_windows
         # stride = self.config.stride if not disable_cache else None
 
-        
+        # (1x1024,4096) = (??,input size,embedding_dim)
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
         xq = self._split_heads(xq)
@@ -945,6 +956,10 @@ class FlaxRPTAttention(nn.Module):
 
             if self.config.add_null_attn:
                 xv, xk, attention_bias = self.concat_null_kv(xv, xk, attention_bias)
+
+            # xq = (1, 1024, 32, 128)
+            # xk = (1, 1024, 32, 128)
+            # attention_bias = (1, 1, 1024, 1024)
             attn_weights = dot_product_attention_weights(
                 xq,
                 xk,
@@ -1605,9 +1620,7 @@ class FlaxRPTLowcoderLayer(nn.Module):
             sliding_window=self.config.sliding_window,
         )
 
-        # what's on attn output[0]?
         attn_output = attn_outputs[0]
-        # TODO: E: add the attention outputs to the hidden states??
         hidden_states = hidden_states + attn_output
 
         # nomalize hidden states
