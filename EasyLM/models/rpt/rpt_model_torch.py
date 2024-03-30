@@ -12,7 +12,15 @@ from typing import Optional, Tuple, Union
 from transformers import AutoTokenizer
 from einops import rearrange
 from torch_utils import make_attention_mask, make_causal_mask, combine_masks
-import torch.nn.functional as F
+
+import jax
+
+# used just for the attention function call
+import jax.numpy as jnp
+from flax.linen.attention import dot_product_attention_weights
+from EasyLM.memory_efficient_attention import dot_product_attention_multihead as efficient_dot_product_attention
+
+
 
 @gin.configurable
 class RPTConfig(PretrainedConfig):
@@ -391,10 +399,9 @@ class TorchRPTAttention(nn.Module):
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
-        # TODO: Figure out the correct input size
         # TODO: Use the initialization function
         self.wq = torch.nn.Parameter(
-            torch.rand(
+            torch.ones(
                 self.embed_dim,
                 config.num_attention_heads * self.head_dim,
                 dtype=self.dtype)
@@ -531,11 +538,11 @@ class TorchRPTAttention(nn.Module):
                                   dtype=self.dtype, rot_dim=self.config.rot_dim)
 
         # transform boolean mask into float mask
-        attention_bias = np.select(
+        attention_bias = torch.Tensor(np.select(
             attention_mask > 0,
             torch.full(attention_mask.shape, 0.0).type(self.dtype),
             torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype),
-        )
+        ))
 
         if self.num_key_value_groups > 1:
             xk = repeat_kv(xk, self.num_key_value_groups)
@@ -548,18 +555,17 @@ class TorchRPTAttention(nn.Module):
                 combine_masks(attention_mask, fcm_mask),
                 '... s q k -> ... s 1 q k'
             )
-            attn_output = F.scaled_dot_product_attention(
-                xq, xk, xv, attention_mask, attn_pdrop, is_causal=True
-            )
 
-            # TODO: Implement
-            """
-            attn_output = F.scaled_dot_product_attention(
-                xq,
-                xk,
-                xv,
-                attn_mask=attention_mask,
-                dropout_p=attn_pdrop,
+            dropout_rng = None
+            if not deterministic and self.config.attn_pdrop > 0.0:
+                dropout_rng = jax.random.key(0)
+
+            attn_output = efficient_dot_product_attention(
+                jnp.array(xq),
+                jnp.array(xk),
+                jnp.array(xv),
+                bias=attention_mask,
+                dropout_rng=dropout_rng,
                 dropout_rate=self.config.attn_pdrop,
                 enable_dropout=not deterministic and self.config.attn_pdrop > 0.0,
                 float32_logits=True,
@@ -568,7 +574,7 @@ class TorchRPTAttention(nn.Module):
                 query_chunk_size=self.config.scan_query_chunk_size,
                 key_chunk_size=self.config.scan_key_chunk_size,
             )
-            """
+
         else:
             if sliding_window and n_windows > 1:
                 xq, xk, xv = map(lambda t: rearrange(t, 'b (s l) ... -> b s l ...', s=n_windows),
@@ -593,31 +599,30 @@ class TorchRPTAttention(nn.Module):
             # xv = torch.Size([1, 1024, 32, 128])
             # attention_mask = torch.Size([1, 1, 1024, 1024])
             # attn_pdrop = 0
-            attn_weights = F.scaled_dot_product_attention(
-                xq, xk, xv, attention_mask, attn_pdrop
-            )
 
-            """
+            dropout_rng = None
+            if not deterministic and self.config.attn_pdrop > 0.0:
+                dropout_rng = jax.random.key(0)
+
             attn_weights = dot_product_attention_weights(
-                xq,
-                xk,
-                bias=attention_bias,
+                jnp.array(xq.detach().numpy()),
+                jnp.array(xk.detach().numpy()),
+                bias=jnp.array(attention_bias.detach().numpy()),
                 dropout_rng=dropout_rng,
                 dropout_rate=self.config.attn_pdrop,
                 deterministic=deterministic,
-                dtype=jnp.promote_types(self.dtype, torch.float32),
-                precision=self.precision,
+                dtype=jnp.float32,
             )
-            """
+
+            attn_weights = torch.Tensor(attn_weights.tolist())
             print(f"{attn_weights.shape=}")
-            self.sow('intermediates', 'attn_weights', attn_weights)
             attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv)
             if sliding_window and n_windows > 1:
                 attn_output = rearrange(attn_output,
                                         'b s l ... -> b (s l) ...', s=n_windows)
 
         attn_output = self._merge_heads(attn_output)
-        attn_output = self.wo.matmul(attn_output)  # TODO: Batch multiply
+        attn_output = self.wo.matmul(attn_output.permute((0, 2, 1))).permute((0, 2, 1))
         # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
         return outputs

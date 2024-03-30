@@ -65,5 +65,7 @@ embedded_input = wte.init_with_output(jax.random.PRNGKey(42), input_id)
 flax_rpt_model = rpt_model.FlaxRPTAttention(rpt_config, dtype=jnp.float32, param_dtype=jnp.float32)
 torch_rpt_model = rpt_model_torch.TorchRPTAttention(rpt_config, dtype=torch.float32, param_dtype=torch.float32)
 
-results = flax_rpt_model.init_with_output(jax.random.PRNGKey(42), jnp.array([embedded_input[0]]), jnp.ones_like(input_id))
-torch_rpt_model.forward(torch.Tensor(np.array([embedded_input[0]])), torch.ones_like(torch.Tensor(input_id)))
+flax_result = flax_rpt_model.init_with_output(jax.random.PRNGKey(42), jnp.array([embedded_input[0]]), jnp.ones_like(input_id))
+torch_result = torch_rpt_model.forward(torch.Tensor(np.array([embedded_input[0]])), torch.ones_like(torch.Tensor(input_id)))
+
+np.testing.assert_almost_equal(torch_result.numpy(), flax_result[0])
