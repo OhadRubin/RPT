@@ -685,7 +685,7 @@ class FlaxRPTAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=my_dense_init(self.config),
+            kernel_init=dense_init(self.config),
             precision=self.precision,
         )
         self.wk = nn.Dense(
@@ -694,7 +694,7 @@ class FlaxRPTAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=my_dense_init(self.config),
+            kernel_init=dense_init(self.config),
             precision=self.precision,
         )
         self.wv = nn.Dense(
@@ -703,7 +703,7 @@ class FlaxRPTAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=my_dense_init(self.config),
+            kernel_init=dense_init(self.config),
             precision=self.precision,
         )
         self.wo = nn.Dense(
@@ -711,7 +711,7 @@ class FlaxRPTAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=my_dense_init(self.config),
+            kernel_init=dense_init(self.config),
             precision=self.precision,
         )
 
@@ -2847,7 +2847,7 @@ class FlaxRPTForCausalLM(FlaxRPTPreTrainedModel):
             "attention_mask": attention_mask,
         }
 
-    def update_inputs_for_generation(self, model_outputs, model_kwargs):
+    def update_inputs_for_genxeration(self, model_outputs, model_kwargs):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         
         if model_kwargs.get("encoded_neighbors", None) is not None:

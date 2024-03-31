@@ -254,11 +254,10 @@ class TorchRPTRMSNorm(nn.Module):
     RMS normalization layer
     """
 
-    def __init__(self, config, dtype, param_dtype):
+    def __init__(self, config, dtype):
         super().__init__()
         self.config = config
         self.dtype = dtype
-        self.param_dtype = param_dtype
         self.eps = self.config.rms_norm_eps
         if self.config.rms_one_baseline:
             self.weight = nn.Parameter(torch.zeros(self.config.hidden_size, dtype=self.param_dtype))
@@ -388,11 +387,10 @@ class TorchRPTAttention(nn.Module):
     The transformer's masked self attention layer
     """
 
-    def __init__(self, config: RPTConfig, dtype: torch.float32, param_dtype: torch.float32):
+    def __init__(self, config: RPTConfig, dtype: torch.float32):
         super().__init__()
         self.config = config
         self.dtype = dtype
-        self.param_dtype = param_dtype
         self.embed_dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
@@ -470,14 +468,6 @@ class TorchRPTAttention(nn.Module):
     ):
         n_windows = self.config.n_windows
         # stride = self.config.stride if not disable_cache else None
-
-        hidden_states_for_mult = torch.permute(hidden_states, (0, 2, 1))
-
-        # wq projects the input embeddings into the query embeddings
-        # query embeddings = d_q, input_embeddings = d
-        # Wq = (d_q x d)
-        # input_embeddings = (len, d)
-        # input_embeddings * Wq.T = (Wq x input_embeddings.T).T
 
         xq, xk, xv = self.wq.forward(hidden_states), self.wk.forward(hidden_states), self.wv.forward(hidden_states)
 
@@ -642,6 +632,7 @@ class TorchRPTAttention(nn.Module):
         return xv, xk, attention_bias
 
 
+# TODO: Currently unused!! make sure you use it or get rid of it
 def dense_init(input_tensor, config, is_embedding=False):
     if config.palm_init:
         if is_embedding:
@@ -650,3 +641,595 @@ def dense_init(input_tensor, config, is_embedding=False):
         return torch.nn.init.normal(tensor=input_tensor, std=torch.sqrt(config.initializer_range / len(input_tensor)))
     else:
         return torch.nn.init.normal(tensor=input_tensor, std=config.initializer_range)
+
+
+class TorchRPTCrossAttention(nn.Module):
+
+    def __init__(self, config: RPTConfig, dtype: torch.float32):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+
+        self.wq = torch.nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
+        )
+
+        self.wk = torch.nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
+        )
+
+        self.wv = torch.nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
+        )
+
+        self.wo = torch.nn.Linear(
+            self.embed_dim,
+            config.num_attention_heads * self.head_dim,
+            bias=False,
+            dtype=dtype
+        )
+
+        # self.resid_dropout = nn.Dropout(rate=config.resid_pdrop,broadcast_dims=(0,))
+
+        if self.config.rot_dim is not None and self.config.rot_dim > 0:
+            rot_dim = self.config.rot_dim
+        else:
+            rot_dim = self.head_dim
+
+        self.freqs_cis = precompute_freqs_cis(
+            rot_dim,
+            config.max_sequence_length * 2,
+            dtype=self.dtype,
+        )
+        self.null_k = self.param(f'null_k', jax.nn.initializers.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
+        self.null_v = self.param(f'null_v', jax.nn.initializers.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
+
+    def _split_heads(self, hidden_states):
+        return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
+
+    def _merge_heads(self, hidden_states):
+        return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            key_value_states: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.Tensor] = None,
+            kv_position_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            output_attentions: bool = False,
+            deterministic: bool = True,
+    ) -> Tuple[torch.ndarray]:
+
+        is_cross_attention = key_value_states is not None
+
+        if not is_cross_attention:
+            xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
+        else:
+            xq, xk, xv = self.wq(hidden_states), self.wk(key_value_states), self.wv(key_value_states)
+
+        xq = self._split_heads(xq)
+        xk = self._split_heads(xk)
+        xv = self._split_heads(xv)
+
+        query_length, key_length = xq.shape[1], xk.shape[1]
+        batch_size = hidden_states.shape[0]
+
+        if position_ids is None:
+            position_ids = torch.arange(query_length, dtype=torch.int32)
+            position_ids = torch.broadcast_to(position_ids[None, :], (batch_size, query_length))
+
+        # TODO: get rid of numpy
+        freqs_cis = np.take(self.freqs_cis, position_ids, axis=0)
+        if not is_cross_attention:
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype, rot_dim=self.config.rot_dim)
+        else:
+            if kv_position_ids is None:
+                kv_position_ids = torch.arange(key_length, dtype=torch.int32)
+                kv_position_ids = torch.broadcast_to(kv_position_ids[None, :], (batch_size, key_length))
+            # TODO: Get rid of numpy
+            freqs_cis_k = np.take(self.freqs_cis, kv_position_ids, axis=0)
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, freqs_cis_k=freqs_cis_k, dtype=self.dtype,
+                                      rot_dim=self.config.rot_dim)
+
+        null_k = torch.broadcast_to(self.null_k, (batch_size, 1, self.num_heads, self.head_dim))
+        xk = torch.concatenate((xk, null_k), dim=-3)
+
+        null_v = torch.broadcast_to(self.null_v, (batch_size, 1, self.num_heads, self.head_dim))
+        xv = torch.concatenate((xv, null_v), dim=-3)
+
+        if attention_mask is not None:
+
+            null_mask = torch.ones((attention_mask.shape[0], 1), dtype=torch.float32)
+            attention_mask = torch.concatenate((attention_mask, null_mask), dim=-1)
+            attention_mask = torch.Tensor([[attention_mask]])
+            # TODO: Get rid of numpy
+            attention_bias = np.select(
+                attention_mask > 0,
+                torch.full(attention_mask.shape, 0.0).type(self.dtype),
+                torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype),
+            )
+        else:
+            attention_bias = None
+
+        # TODO: Get rid of JAX
+        dropout_rng = None
+        if not deterministic and self.config.attn_pdrop > 0.0:
+            dropout_rng = self.make_rng("dropout")
+
+        attn_weights = dot_product_attention_weights(
+            xq,
+            xk,
+            bias=attention_bias,
+            dropout_rng=dropout_rng,
+            dropout_rate=self.config.attn_pdrop,
+            deterministic=deterministic,
+            dtype=jnp.float32,
+            precision=self.precision,
+        )
+        attn_weights = torch.Tensor(attn_weights.tolist())
+
+        attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv)
+
+        attn_output = self._merge_heads(attn_output)
+        attn_output = self.wo(attn_output)
+        # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
+        outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+        return outputs
+
+
+class TorchRPTMLP(nn.Module):
+
+    def __init__(self, config: RPTConfig, dtype: torch.float32, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config = config
+        self.dtype = dtype
+
+        # TODO: Don't forget to initialize
+        self.w1 = nn.Linear(
+            config.intermediate_size if config.gated_ff else 4 * config.hidden_size,
+            dtype=self.dtype,
+            bias=False,
+        )
+        self.w2 = nn.Linear(
+            config.hidden_size,
+            dtype=self.dtype,
+            bias=False,
+        )
+        if self.config.gated_ff:
+            self.w3 = nn.Linear(
+                config.intermediate_size,
+                dtype=self.dtype,
+                bias=False,
+            )
+        # TODO: WHAT IS THIS??
+        self.dropout = nn.Dropout(p=self.config.resid_pdrop, broadcast_dims=(0,))
+
+    def forward(self, x: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        if self.config.gated_ff:
+            x1 = torch.silu(self.w1(x))
+            x3 = self.w3(x)
+            if self.config.mult_in_complex:
+                x = mult_in_complex(x1, x3)
+            else:
+                x = x1 * x3
+            x = self.w2(x)
+
+            x = self.dropout(x, deterministic=deterministic)
+        else:
+            x = torch.gelu(self.w1(x))
+            x = self.dropout(x, deterministic=deterministic)
+            x = self.w2(x)
+
+        return x
+
+
+class TorchRPTLowcoderLayer(nn.Module):
+
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config = config
+        self.dtype = dtype
+        attention_module = TorchRPTAttention
+        if self.config.remat_attention != '':
+            attention_module = remat(
+                TorchRPTAttention, static_argnums=(3, 4, 5, -1),
+                policy=get_gradient_checkpoint_policy(self.config.remat_attention)
+            )
+        self.attention = attention_module(
+            self.config,
+            dtype=self.dtype,
+        )
+        mlp_module = TorchRPTMLP
+        if self.config.remat_mlp != '':
+            mlp_module = remat(
+                TorchRPTMLP, static_argnums=(1,),
+                policy=get_gradient_checkpoint_policy(self.config.remat_mlp)
+            )
+
+        self.feed_forward = mlp_module(
+            self.config,
+            dtype=self.dtype
+        )
+        self.attention_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.ffn_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
+
+    def forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            fcm_mask: Optional[torch.Tensor] = None,
+    ):
+        # run self attention on the hidden states
+        attn_outputs = self.attention(
+            self.attention_norm(hidden_states),
+            attention_mask,
+            position_ids,
+            deterministic,
+            init_cache,
+            output_attentions,
+            fcm_mask,
+            sliding_window=self.config.sliding_window,
+        )
+
+        attn_output = attn_outputs[0]
+        hidden_states = hidden_states + attn_output
+
+        # nomalize hidden states
+        feed_forward_input = self.ffn_norm(hidden_states)
+
+        # run the nomlaized hidden states into the MLP
+        if self.config.scan_mlp:
+            feed_forward_input = einops.rearrange(
+                feed_forward_input,
+                '... (b s) d -> ... b s d',
+                b=self.config.scan_mlp_chunk_size
+            )
+
+            def mlp_forward(mlp, carry, x):
+                return None, mlp(x, deterministic)
+
+            scan_axis = feed_forward_input.ndim - 3
+
+            _, feed_forward_hidden_states = nn.scan(
+                mlp_forward,
+                variable_broadcast="params",
+                split_rngs={"params": False, "dropout": True},
+                in_axes=scan_axis,
+                out_axes=scan_axis,
+            )(self.feed_forward, None, feed_forward_input)
+            feed_forward_hidden_states = einops.rearrange(
+                feed_forward_hidden_states,
+                '... b s d -> ... (b s) d'
+            )
+        else:
+            feed_forward_hidden_states = self.feed_forward(
+                feed_forward_input,
+                deterministic,
+            )
+
+        # E: Add the goddamn linear layer output to the hidden states?
+        hidden_states = hidden_states + feed_forward_hidden_states
+
+        # what's on attn_output[1:]??
+        return (hidden_states,) + attn_outputs[1:]
+
+
+class TorchRPTLowcoderLayerCollection(nn.Module):
+    """
+    Basic series of masked attention encoders
+    """
+
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config = config
+        self.dtype = dtype
+        block = TorchRPTLowcoderLayer
+        if self.config.remat_block != '':
+            block = remat(
+                TorchRPTLowcoderLayer, static_argnums=(3, 4, 5),
+                policy=get_gradient_checkpoint_policy(self.config.remat_block)
+            )
+        assert (self.config.num_hidden_layers % 2) == 0, f"config.num_hidden_layers should be devisible by 2"
+        num_hidden_layers = self.config.num_hidden_layers // 2
+        print("In Lowcoder: Using {} layers".format(num_hidden_layers))
+        self.blocks = [
+            block(
+                self.config,
+                name=str(i),
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                precision=self.precision
+            ) for i in range(num_hidden_layers)
+        ]
+
+    def forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+    ):
+        all_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+
+        fcm_mask = None
+
+        for block in self.blocks:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            layer_outputs = block(
+                hidden_states,
+                attention_mask,
+                position_ids,
+                deterministic,
+                init_cache,
+                output_attentions,
+                fcm_mask,
+            )
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_attentions += (layer_outputs[1],)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        outputs = (hidden_states, all_hidden_states, all_attentions)
+
+        if not return_dict:
+            return outputs
+
+        return FlaxBaseModelOutput(
+            last_hidden_state=hidden_states, hidden_states=all_hidden_states, attentions=all_attentions
+        )
+
+
+class TorchRPTLowcoder(nn.Module):
+
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config = config
+        self.dtype = dtype
+        self.layers = TorchRPTLowcoderLayerCollection(self.config, dtype=self.dtype)
+
+    def forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+    ):
+        outputs = self.layers(
+            hidden_states,
+            attention_mask,
+            position_ids=position_ids,
+            deterministic=deterministic,
+            init_cache=init_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        if not return_dict:
+            return outputs
+
+        return FlaxBaseModelOutput(
+            last_hidden_state=outputs.last_hidden_state,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class TorchRPTChunkedCrossAttention(nn.Module):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config = config
+        self.dtype = dtype
+        self.chunk_size = self.config.chunk_size
+        self.num_neighbors = self.config.num_neighbors
+        self.cross_attention = TorchRPTCrossAttention(self.config, dtype=self.dtype)
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            neighbor_hidden_states,
+            neighbor_mask,
+            position_ids: Optional[torch.Tensor] = None,
+            output_attentions: bool = False,
+            deterministic: bool = True,
+    ) -> Tuple[torch.Tensor]:
+
+        chunk_size = self.chunk_size
+        causal_padding = chunk_size - 1
+        num_devices, seq_len, hidden_dim = hidden_states.shape
+        num_document_chunks, num_neighbors, _, _ = neighbor_hidden_states.shape
+
+        # -> (-1, num_devices_chunks, num_neighbors, 2*chunk_size, hidden_dim)
+        neighbor_hidden_states = neighbor_hidden_states.reshape([-1, 2 * chunk_size * num_neighbors, hidden_dim])
+        neighbor_mask = neighbor_mask.reshape([-1, 2 * chunk_size * num_neighbors])
+        local_device_count = hidden_states.shape[0]
+        if num_document_chunks > 1:
+            num_devices_chunks = num_document_chunks // local_device_count
+            # ->  (-1 ,chunk_size, hidden_dim)
+            hidden_states = hidden_states.reshape([-1, num_devices_chunks * chunk_size, hidden_dim])
+            hidden_states = torch.pad(hidden_states[:, causal_padding:, :], ((0, 0), (0, causal_padding), (0, 0)), 'constant')
+            hidden_states = hidden_states.reshape([-1, chunk_size, hidden_dim])
+
+            position_ids = torch.arange(chunk_size) + chunk_size - 1
+            position_ids = torch.broadcast_to(position_ids[None, :], (hidden_states.shape[0], chunk_size))
+        else:
+            hidden_states = hidden_states.reshape([1, 1, hidden_dim])
+            assert position_ids is not None
+
+        kv_position_ids = torch.arange(2 * chunk_size)
+        kv_position_ids = torch.broadcast_to(kv_position_ids[None, :],
+                                           (num_document_chunks * num_neighbors, 2 * chunk_size))
+        kv_position_ids = kv_position_ids.reshape([-1, 2 * chunk_size * num_neighbors])
+
+        # cross attention
+        output = self.cross_attention(
+            hidden_states=hidden_states,
+            key_value_states=neighbor_hidden_states,
+            position_ids=position_ids,
+            kv_position_ids=kv_position_ids,
+            attention_mask=neighbor_mask,
+            output_attentions=output_attentions,
+            deterministic=deterministic)
+
+        # reshape back to original sequence
+        cross_attention_out = output[0]
+        if num_document_chunks > 1:
+            cross_attention_out = cross_attention_out.reshape([-1, num_devices_chunks * chunk_size, hidden_dim])
+            # # pad back to original, with 0s at the beginning (which will be added to the residual and be fine)
+            cross_attention_out = torch.pad(cross_attention_out, ((0, 0), (causal_padding, 0), (0, 0)), 'constant')[:,
+                                  :-causal_padding]
+        cross_attention_out = cross_attention_out.reshape([num_devices, seq_len, hidden_dim])
+        return (cross_attention_out,) + output[1:]
+
+
+class FlaxRPTUpcoderLayer(nn.Module):
+
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, has_cca: bool = False):
+        super(FlaxRPTUpcoderLayer, self)
+
+        attention_module = TorchRPTAttention
+        if self.config.remat_attention != '':
+            attention_module = remat(
+                TorchRPTAttention, static_argnums=(3, 4, 5, -1),
+                policy=get_gradient_checkpoint_policy(self.config.remat_attention)
+            )
+        if self.has_cca:
+            self.cca = TorchRPTChunkedCrossAttention(
+                self.config,
+                dtype=self.dtype
+            )
+            self.cca_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+            if self.config.use_cca_norm2:
+                self.cca_norm2 = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+            else:
+                self.cca_norm2 = None
+
+        else:
+            self.cca = None
+            self.cca_norm = None
+
+        self.attention = attention_module(
+            self.config,
+            dtype=self.dtype
+        )
+        mlp_module = TorchRPTMLP
+        if self.config.remat_mlp != '':
+            mlp_module = remat(
+                TorchRPTMLP, static_argnums=(1,),
+                policy=get_gradient_checkpoint_policy(self.config.remat_mlp)
+            )
+
+        self.feed_forward = mlp_module(
+            self.config,
+            dtype=self.dtype
+        )
+        self.attention_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+        self.ffn_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+
+    def forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            neighbor_hidden_states=None,
+            neighbor_mask=None,
+            chunk_index=None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            fcm_mask: Optional[jnp.ndarray] = None,
+    ):
+
+        print(f"In Upcoder Layer: Using CCA: {self.has_cca}")
+        attn_outputs = self.attention(
+            self.attention_norm(hidden_states),
+            attention_mask,
+            position_ids,
+            deterministic,
+            init_cache,
+            output_attentions,
+            fcm_mask,
+            sliding_window=self.config.sliding_window,
+        )
+        attn_output = attn_outputs[0]
+        hidden_states = hidden_states + attn_output
+
+        if self.cca is not None and neighbor_hidden_states is not None:
+            if self.cca_norm2 is not None:
+                neighbor_hidden_states = self.cca_norm2(neighbor_hidden_states)
+
+            cca_output = self.cca(hidden_states=self.cca_norm(hidden_states),
+                                  neighbor_hidden_states=neighbor_hidden_states,
+                                  neighbor_mask=neighbor_mask,
+                                  position_ids=chunk_index,
+                                  output_attentions=output_attentions,
+                                  deterministic=deterministic,
+
+                                  )
+            cca_hidden_states = cca_output[0]
+            hidden_states = cca_hidden_states + hidden_states
+
+        feed_forward_input = self.ffn_norm(hidden_states)
+
+        if self.config.scan_mlp:
+            feed_forward_input = einops.rearrange(
+                feed_forward_input,
+                '... (b s) d -> ... b s d',
+                b=self.config.scan_mlp_chunk_size
+            )
+
+            def mlp_forward(mlp, carry, x):
+                return None, mlp(x, deterministic)
+
+            scan_axis = feed_forward_input.ndim - 3
+
+            _, feed_forward_hidden_states = nn.scan(
+                mlp_forward,
+                variable_broadcast="params",
+                split_rngs={"params": False, "dropout": True},
+                in_axes=scan_axis,
+                out_axes=scan_axis,
+            )(self.feed_forward, None, feed_forward_input)
+            feed_forward_hidden_states = einops.rearrange(
+                feed_forward_hidden_states,
+                '... b s d -> ... (b s) d'
+            )
+        else:
+            feed_forward_hidden_states = self.feed_forward(
+                feed_forward_input,
+                deterministic,
+            )
+
+        hidden_states = hidden_states + feed_forward_hidden_states
+
+        return (hidden_states,) + attn_outputs[1:]
