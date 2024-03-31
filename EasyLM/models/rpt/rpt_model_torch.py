@@ -1,17 +1,20 @@
 import json
+from collections import namedtuple
 
 import einops
 import gin
 import numpy as np
+import optax
 import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 from mlxu import function_args_to_config, load_pickle, open_file
 from ml_collections import ConfigDict
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Dict
 from transformers import AutoTokenizer
 from einops import rearrange
 from torch_utils import make_attention_mask, make_causal_mask, combine_masks
+from dataclasses import dataclass
 
 import jax
 
@@ -20,6 +23,125 @@ import jax.numpy as jnp
 from flax.linen.attention import dot_product_attention_weights
 from EasyLM.memory_efficient_attention import dot_product_attention_multihead as efficient_dot_product_attention
 
+
+RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])
+EncodedNeighbors = namedtuple('EncodedNeighbors', ['neighbor_hidden_states', 'neighbor_mask',"chunk_index"])
+
+@dataclass
+class FlaxBaseModelOutput:
+    last_hidden_state: torch.Tensor = None
+    hidden_states: Optional[Tuple[torch.Tensor]] = None
+    attentions: Optional[Tuple[torch.Tensor]] = None
+
+@dataclass
+class FlaxBaseModelOutputCrossAttentions:
+    last_hidden_state: torch.Tensor = None
+    hidden_states: Optional[Tuple[torch.Tensor]] = None
+    attentions: Optional[Tuple[torch.Tensor]] = None
+    cross_attentions: Optional[Tuple[torch.Tensor]] = None
+
+
+@dataclass
+class FlaxRPTRetrieverEncodedOutput:
+    original_hidden_states: torch.Tensor = None
+    encoded_hidden_states: torch.Tensor = None
+    attention_mask: torch.Tensor = None
+    key_chunks: torch.Tensor = None
+    query_chunks: torch.Tensor = None
+    chunk_mask: torch.Tensor = None
+    preret_attention: Optional[torch.Tensor] = None
+    position_ids: Optional[torch.Tensor] = None
+
+
+@dataclass
+class FlaxRPTRetrieverEncodedOutput:
+    original_hidden_states: torch.Tensor = None
+    encoded_hidden_states: torch.Tensor = None
+    attention_mask: torch.Tensor = None
+    key_chunks: torch.Tensor = None
+    query_chunks: torch.Tensor = None
+    chunk_mask: torch.Tensor = None
+    preret_attention: Optional[torch.Tensor] = None
+    position_ids: Optional[torch.Tensor] = None
+
+
+@dataclass
+class FlaxRPTRetrieverNeighborOutput:
+    aux_loss: torch.Tensor = None
+    loss_scale: torch.Tensor = None
+    neighbor_hidden_states: torch.Tensor = None
+    neighbor_mask: torch.Tensor = None
+    retrieval_metrics: Optional[Dict[str, torch.Tensor]] = None
+
+
+@dataclass
+class FlaxRPTLowcoderRetrieverEncodedOutput:
+    hidden_states: torch.Tensor = None
+    attention_mask: torch.Tensor = None
+    neighbor_hidden_states: torch.Tensor = None
+    neighbor_mask: torch.Tensor = None
+
+
+@dataclass
+class FlaxRPTModelOutput:
+    last_hidden_state: torch.Tensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None
+    upcoder_hidden_states: Optional[Tuple[torch.Tensor]] = None
+    upcoder_attentions: Optional[Tuple[torch.Tensor]] = None
+    cross_attentions: Optional[Tuple[torch.Tensor]] = None
+    lowcoder_last_hidden_state: Optional[torch.Tensor] = None
+    lowcoder_hidden_states: Optional[Tuple[torch.Tensor]] = None
+    lowcoder_attentions: Optional[Tuple[torch.Tensor]] = None
+    retriever_output: FlaxRPTRetrieverNeighborOutput = None
+    retriever_input: Optional[torch.Tensor] = None
+
+
+@dataclass
+class FlaxRPTLMOutput:
+    logits: torch.Tensor = None
+    past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None
+    upcoder_hidden_states: Optional[Tuple[torch.Tensor]] = None
+    upcoder_attentions: Optional[Tuple[torch.Tensor]] = None
+    cross_attentions: Optional[Tuple[torch.Tensor]] = None
+    lowcoder_last_hidden_state: Optional[torch.Tensor] = None
+    lowcoder_hidden_states: Optional[Tuple[torch.Tensor]] = None
+    lowcoder_attentions: Optional[Tuple[torch.Tensor]] = None
+    retriever_output: FlaxRPTRetrieverNeighborOutput = None
+    retriever_input: Optional[torch.Tensor] = None
+
+
+def m1_cosine_decay_schedule(
+    decay_steps: int,
+    min_value:float,
+    max_value:int,
+    exponent: float = 1.0,
+):
+  if not decay_steps > 0:
+    raise ValueError('The cosine_decay_schedule requires positive decay_steps!')
+  def schedule(count):
+    count = jnp.minimum(count, decay_steps)
+    cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * count / decay_steps))
+    decayed = 1-(cosine_decay ** exponent)
+    decayed = (1 - min_value) * decayed + min_value
+    return max_value*decayed
+
+  return schedule
+
+def topk_chunks(retriever_scores,num_candidates,*,where=None):
+    # TODO: This used to have a @jax.vmap annotation on it, let's pytorch it
+    def _topk_chunks(retriever_scores):
+        return (-retriever_scores).argsort()[:num_candidates] #k = num_candidates
+    if where is not None:
+        retriever_scores = jnp.where(where,retriever_scores,-jnp.inf)
+    return _topk_chunks(retriever_scores)
+
+def create_segment_mask(total_num_chunks,n_skip_chunks):
+
+    # TODO: This used to have a @jax.vmap annotation on it, let's pytorch it
+    def _create_segment_mask(chunk_index):
+        max_chunk = n_skip_chunks*(chunk_index//n_skip_chunks)
+        return jnp.arange(total_num_chunks)<max_chunk - 2
+    return _create_segment_mask(jnp.arange(total_num_chunks))
 
 
 @gin.configurable
@@ -693,8 +815,9 @@ class TorchRPTCrossAttention(nn.Module):
             config.max_sequence_length * 2,
             dtype=self.dtype,
         )
-        self.null_k = self.param(f'null_k', jax.nn.initializers.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
-        self.null_v = self.param(f'null_v', jax.nn.initializers.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
+        # TODO: Fishy. including the other initialization and null attention
+        self.null_k = self.param(f'null_k', torch.nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
+        self.null_v = self.param(f'null_v', torch.nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
 
     def _split_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
@@ -952,10 +1075,8 @@ class TorchRPTLowcoderLayerCollection(nn.Module):
         self.blocks = [
             block(
                 self.config,
-                name=str(i),
                 dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                precision=self.precision
+                param_dtype=self.param_dtype
             ) for i in range(num_hidden_layers)
         ]
 
@@ -1167,7 +1288,7 @@ class FlaxRPTUpcoderLayer(nn.Module):
             deterministic: bool = True,
             init_cache: bool = False,
             output_attentions: bool = False,
-            fcm_mask: Optional[jnp.ndarray] = None,
+            fcm_mask: Optional[torch.Tensor] = None,
     ):
 
         print(f"In Upcoder Layer: Using CCA: {self.has_cca}")
@@ -1213,6 +1334,7 @@ class FlaxRPTUpcoderLayer(nn.Module):
 
             scan_axis = feed_forward_input.ndim - 3
 
+            # TODO: handle
             _, feed_forward_hidden_states = nn.scan(
                 mlp_forward,
                 variable_broadcast="params",
@@ -1233,3 +1355,637 @@ class FlaxRPTUpcoderLayer(nn.Module):
         hidden_states = hidden_states + feed_forward_hidden_states
 
         return (hidden_states,) + attn_outputs[1:]
+
+
+class FlaxRPTUpcoderLayerCollection(nn.Module):
+
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.config = config
+        self.dtype = dtype
+        block = FlaxRPTUpcoderLayer
+        if self.config.remat_block != '':
+            block = remat(
+                FlaxRPTUpcoderLayer, static_argnums=(6, 7, 8, 9),
+                policy=get_gradient_checkpoint_policy(self.config.remat_block)
+            )
+        assert (self.config.num_hidden_layers % 2) == 0, f"config.num_hidden_layers should be divisible by 2"
+        num_hidden_layers = self.config.num_hidden_layers // 2
+        print("In Upcoder: Using {} layers".format(num_hidden_layers))
+
+        def has_cca(layer_index):
+            if self.config.cca_freq is None or self.config.cca_freq == 0:
+                return False
+            return (layer_index % self.config.cca_freq) == 0
+
+        self.blocks = [
+            block(
+                self.config,
+                dtype=self.dtype,
+                has_cca=has_cca(i),
+            ) for i in range(num_hidden_layers)
+        ]
+
+    def forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            neighbor_hidden_states=None,
+            neighbor_mask=None,
+            chunk_index=None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+    ):
+        all_attentions = () if output_attentions else None
+        all_cross_attentions = () if output_attentions else None
+        all_hidden_states = () if output_hidden_states else None
+
+        for block in self.blocks:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            layer_outputs = block(
+                hidden_states,  # 0
+                attention_mask,  # 1
+                position_ids,  # 2
+                neighbor_hidden_states,  # 3
+                neighbor_mask,  # 4
+                chunk_index,  # 5
+                deterministic,  # 6
+                init_cache,  # 7
+                output_attentions,  # 8
+                None,  # fcm_mask= #9
+            )
+            hidden_states = layer_outputs[0]
+
+            if output_attentions:
+                all_attentions += (layer_outputs[1],)
+                if block.has_cca:
+                    all_cross_attentions += (layer_outputs[2],)
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        # this contains possible `None` values - `FlaxGPTJModule` will filter them out
+        outputs = (hidden_states, all_hidden_states, all_attentions)
+
+        if not return_dict:
+            return outputs
+
+        return FlaxBaseModelOutputCrossAttentions(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            cross_attentions=all_cross_attentions,
+        )
+
+
+class FlaxRPTNeighborAugmentor(nn.Module):
+
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.postret_bidir_attention = TorchRPTCrossAttention(self.config, dtype=self.dtype)
+        self.postret_bi_attention_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+        self.query_nei_xattention_qnorm = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+        self.query_nei_xattention_knorm = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+
+        self.query_nei_xattention = TorchRPTCrossAttention(self.config, dtype=self.dtype)
+
+    def forward(self, hidden_states: torch.Tensor, neighbor_hidden_states: torch.Tensor, neighbor_mask: torch.Tensor, output_attentions: torch.Tensor, deterministic: bool,
+                 query_hidden_states: torch.Tensor = None):
+        neighbor_hidden_states_shape = neighbor_hidden_states.shape
+        num_document_chunks, num_neighbors, ret_size, hidden_dim = neighbor_hidden_states_shape
+        assert ret_size == 2 * self.config.chunk_size
+        neighbor_hidden_states = neighbor_hidden_states.reshape([num_document_chunks * num_neighbors,
+                                                                 ret_size,
+                                                                 hidden_dim])
+        neighbor_mask = neighbor_mask.reshape([num_document_chunks * num_neighbors, ret_size])
+
+        # Non-causal self attention with the two parts of the neighbor chunk
+        # For each neighbor we also retrieve it's subsequent chunk, so it helps to have the two parts of the neighbor chunk
+        # Attend to each other (it was only causal before)
+        postret_bi_output = self.postret_bidir_attention(
+            self.postret_bi_attention_norm(neighbor_hidden_states),
+            attention_mask=neighbor_mask,
+            deterministic=deterministic,
+            output_attentions=output_attentions)  # need(!!!) to cache this during generation
+        neighbor_hidden_states = postret_bi_output[0] + neighbor_hidden_states
+
+        # Cross Attention with the neighbor chunk hidden states as Q, and the query chunk hidden states as KV
+        if query_hidden_states is None:  # if we didn't get it from update_inputs_for_generation
+            query_hidden_states = hidden_states
+        query_hidden_states = einops.repeat(query_hidden_states.reshape([-1, self.config.chunk_size, hidden_dim]),
+                                            'b n d -> (b k) n d', n=self.config.chunk_size, k=num_neighbors)
+        assert query_hidden_states.shape[0] == num_document_chunks * num_neighbors
+
+        augmented_xattention_output = self.query_nei_xattention(
+            hidden_states=self.query_nei_xattention_qnorm(neighbor_hidden_states),
+            key_value_states=self.query_nei_xattention_knorm(query_hidden_states),
+            output_attentions=output_attentions,
+            deterministic=deterministic
+        )
+        neighbor_hidden_states = augmented_xattention_output[0] + neighbor_hidden_states
+
+        neighbor_hidden_states = neighbor_hidden_states.reshape(neighbor_hidden_states_shape)
+
+        return (neighbor_hidden_states,) + postret_bi_output[1:] + augmented_xattention_output[1:]
+
+
+class FlaxRPTCrossNeighborAugmentor(nn.Module):
+    def __init__(self, config: RPTConfig, device_count, num_devices_chunks, num_neighbors, dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.cross_neig_causal_att = TorchRPTAttention(self.config, dtype=self.dtype)
+        self.xnei_norm1 = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+        self.xnei_norm2 = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+        # [device_count, num_devices_chunks*num_neighbors, 1]
+        # TODO: handle initialization with dense init
+        # TODO: missing in_features, need to run to figure out
+        self.weight = nn.Linear(in_features=device_count*num_devices_chunks*num_neighbors, out_features=1, dtype=self.dtype, bias=True)
+        if self.config.use_xnei_bias:
+            self.xnei_bias = self.param(f'xnei_bias', jax.nn.initializers.normal(0.01),
+                                        (1, 1, 1, self.config.hidden_size))
+        else:
+            self.xnei_bias = None
+
+    def forward(self,
+                 neighbor_hidden_states: torch.Tensor,
+                 neighbor_mask: torch.Tensor,
+                 output_attentions: torch.Tensor,
+                 deterministic: bool,
+                 device_count: int):
+        num_document_chunks, num_neighbors, ret_size, hidden_dim = neighbor_hidden_states.shape
+        if num_document_chunks > 1:
+            num_devices_chunks = num_document_chunks // device_count
+            # this pooled tensor has shape [device_count, num_devices_chunks*num_neighbors, hidden_dim]
+        else:
+            num_devices_chunks = 1
+        new_shape = [device_count, num_devices_chunks * num_neighbors, ret_size, hidden_dim]
+        pooled_neighbor_hidden_states = neighbor_hidden_states.reshape(new_shape).mean(dim=-2)
+
+        pooled_neighbor_mask = neighbor_mask.reshape([device_count, num_devices_chunks * num_neighbors, ret_size]).any(dim=-1)
+
+        cross_neig_out = self.cross_neig_causal_att(
+            hidden_states=self.xnei_norm1(pooled_neighbor_hidden_states),
+            attention_mask=pooled_neighbor_mask,
+            output_attentions=output_attentions,
+            deterministic=deterministic,
+            sliding_window=False,
+            # disable_cache=False,
+        )
+
+        pooled_neighbor_hidden_states = cross_neig_out[0] + pooled_neighbor_hidden_states
+        pooled_neighbor_hidden_states = self.xnei_norm2(pooled_neighbor_hidden_states)
+        ret_gate_score = self.weight(
+            pooled_neighbor_hidden_states)  # [device_count, num_devices_chunks*num_neighbors, 1]
+        ret_gate_score = rearrange(ret_gate_score, 't (c k) 1 -> (t c) k 1 1 ',
+                                   t=device_count, c=num_devices_chunks, k=num_neighbors)
+
+        if self.xnei_bias is not None:
+            neighbor_hidden_states += ret_gate_score * self.xnei_bias
+        else:
+            ret_gate_score = 0.1 + 0.9 * torch.sigmoid(ret_gate_score / hidden_dim)
+            neighbor_hidden_states = ret_gate_score * neighbor_hidden_states
+        return (neighbor_hidden_states,) + cross_neig_out[1:]
+
+
+class FlaxRPTUpcoder(nn.Module):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+
+        if self.config.augment_neighbors:
+            self.neighbor_augmentor = FlaxRPTNeighborAugmentor(self.config, dtype=self.dtype)
+        else:
+            self.neighbor_augmentor = None
+
+        if self.config.augment_across_neighbors:
+            # TODO: Fix parameters
+            self.neighbor_cross_augmentor = FlaxRPTCrossNeighborAugmentor(self.config, dtype=self.dtype)
+        else:
+            self.neighbor_cross_augmentor = None
+        self.layers = FlaxRPTUpcoderLayerCollection(self.config, dtype=self.dtype)
+
+    def augment(self,
+                hidden_states: torch.Tensor,
+                neighbor_hidden_states: torch.Tensor,
+                neighbor_mask: torch.Tensor,
+                deterministic: bool = True,
+                output_attentions: bool = False,
+                ):
+        if self.neighbor_augmentor is not None and neighbor_hidden_states is not None:
+            nei_aug_outputs = self.neighbor_augmentor(
+                hidden_states,
+                neighbor_hidden_states=neighbor_hidden_states,
+                neighbor_mask=neighbor_mask,
+                deterministic=deterministic,
+                output_attentions=output_attentions,
+            )
+            neighbor_hidden_states = nei_aug_outputs[0]
+        if self.neighbor_cross_augmentor is not None and neighbor_hidden_states is not None:
+            nei_xaug_outputs = self.neighbor_cross_augmentor(
+                neighbor_hidden_states=neighbor_hidden_states,
+                neighbor_mask=neighbor_mask,
+                deterministic=deterministic,
+                output_attentions=output_attentions,
+                device_count=hidden_states.shape[0],
+            )
+            neighbor_hidden_states = nei_xaug_outputs[0]
+        return neighbor_hidden_states
+
+    def forward(
+            self,
+            hidden_states,
+            attention_mask=None,
+            position_ids=None,
+            neighbor_hidden_states=None,
+            neighbor_mask=None,
+            chunk_index=None,
+            deterministic: bool = True,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+    ):
+        if chunk_index is None:
+            neighbor_hidden_states = self.augment(
+                hidden_states,
+                neighbor_hidden_states,
+                neighbor_mask,
+                deterministic,
+                output_attentions,
+            )
+        # else We are generating... And have already augmented the neighbor hidden states.
+
+        outputs = self.layers(
+            hidden_states,
+            attention_mask,
+            position_ids=position_ids,
+            neighbor_hidden_states=neighbor_hidden_states,
+            neighbor_mask=neighbor_mask,
+            chunk_index=chunk_index,
+            deterministic=deterministic,
+            init_cache=init_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        if not return_dict:
+            return outputs
+
+        return FlaxBaseModelOutput(
+            last_hidden_state=outputs.last_hidden_state,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class FlaxRPTRetriever(nn.Module):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.preret_bidir_attention = TorchRPTCrossAttention(self.config, dtype=self.dtype)
+        self.preret_bi_attention_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+        self.pre_key_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+        # TODO: handle initialization
+        # TODO: handle input size
+        self.key_projection = nn.Linear(
+            out_features=self.config.hidden_size,
+            dtype=self.dtype,
+            bias=True
+        )
+        self.pre_query_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+        # TODO: handle initialization
+        # TODO: handle input size
+        self.query_projection = nn.Linear(
+            out_features=self.config.hidden_size,
+            dtype=self.dtype,
+            bias=True,
+        )
+        self.fill_value = self.config.retriever_fill_value
+        self.n_skip_chunks = (self.config.max_sequence_length // self.config.n_windows) // self.config.chunk_size
+        self.num_neighbors = self.config.num_neighbors
+        self.threshold_nei_scores = self.config.threshold_nei_scores
+        self.num_sequence_chunks = self.config.num_sequence_chunks
+        if self.config.aux_loss_schedule_steps is not None:
+            assert self.config.aux_scale is not None
+            self.aux_scale = self.config.aux_scale
+            self.aux_loss_schedule_fn = optax.linear_schedule(0, 1, self.config.aux_loss_schedule_steps)
+
+        if self.config.max_margin is not None and self.config.margin_schedule_steps is not None:
+            assert self.config.max_margin >= 1
+            self.increase_margin_schedule_fn = optax.linear_schedule(1, self.config.max_margin,
+                                                                     self.config.margin_schedule_steps)
+
+        if self.config.ss_schedule_steps is not None and \
+                self.config.scheduled_sampling_max_prob is not None \
+                and self.config.scheduled_sampling_min_prob is not None \
+                and self.has_rng("dropout"):
+            self.ss_rng = self.make_rng("dropout")
+            self.scheduled_sampling_schedule_fn = m1_cosine_decay_schedule(decay_steps=self.config.ss_schedule_steps,
+                                                                           min_value=self.config.scheduled_sampling_min_prob,
+                                                                           max_value=self.config.scheduled_sampling_max_prob)
+
+    def forward(
+            self,
+            hidden_states: torch.Tensor,
+            attention_mask: torch.Tensor = None,
+            retriever_supervision: RetrieverSupervision = None,
+            train_step: Optional[int] = None,
+            deterministic: bool = True,
+            output_attentions: bool = False,
+    ):
+
+        encoded_output = self.preret_encode(
+            hidden_states,
+            attention_mask,
+            deterministic,
+            output_attentions)
+
+        query_based_scores = torch.einsum('qd,kd->qk', encoded_output.query_chunks,
+                                        encoded_output.key_chunks)
+        query_based_scores /= torch.sqrt(self.config.hidden_size)
+
+        segment_mask = create_segment_mask(query_based_scores.shape[0], self.n_skip_chunks)
+
+        chunk_mask = encoded_output.chunk_mask
+        chunk_mask &= segment_mask
+        # TODO: Might not be relevant in inference
+        if retriever_supervision is not None:
+            aux_loss, target_neighbor_mask, target_score_based_idx, ret_metrics = self.compute_retriever_loss(
+                query_based_scores,
+                retriever_supervision,
+                chunk_mask,
+                train_step)
+        else:
+            aux_loss = None
+            target_neighbor_mask = None
+            target_score_based_idx = None
+            ret_metrics = None
+
+        query_score_based_idx = topk_chunks(query_based_scores, num_candidates=self.num_neighbors, where=chunk_mask)
+
+        top_nei_idx, nei_mask = self.apply_scheduled_sampling(
+            query_score_based_idx,
+            torch.take_along_axis(chunk_mask, query_score_based_idx, axis=-1),
+            target_score_based_idx,
+            target_neighbor_mask,
+            train_step,
+            deterministic)
+        neighbor_hidden_states = self.lookup_neighbor_states(encoded_output.encoded_hidden_states, top_nei_idx)
+        # TODO: fishy unsqueeze
+        nei_mask = torch.broadcast_to(nei_mask.unsqueeze(), neighbor_hidden_states.shape[:-1])
+        return FlaxRPTRetrieverNeighborOutput(aux_loss=aux_loss if aux_loss is not None else None,
+                                              loss_scale=self.get_loss_scale(
+                                                  train_step) if aux_loss is not None else None,
+                                              neighbor_hidden_states=neighbor_hidden_states,
+                                              neighbor_mask=nei_mask,
+                                              retrieval_metrics=jax.tree_map(lambda x: x.mean(),
+                                                                             ret_metrics) if ret_metrics is not None else None,
+                                              )
+
+    # @classmethod
+    def lookup_neighbor_states(cls, cand_hidden_states: torch.Tensor, top_nei_idx: torch.Tensor):
+        num_document_chunks = top_nei_idx.shape[0]
+        shifted_hidden_states = torch.pad(cand_hidden_states[1:, ...], ((0, 1), (0, 0), (0, 0)))
+        curr_neighbor_hidden_states = cand_hidden_states[top_nei_idx.reshape(-1)]
+        next_neighbor_hidden_states = shifted_hidden_states[top_nei_idx.reshape(-1)]
+        neighbor_hidden_states = torch.concatenate((curr_neighbor_hidden_states, next_neighbor_hidden_states), dim=-2)
+        neighbor_hidden_states = einops.rearrange(neighbor_hidden_states, '(b k) r d -> b k r d', b=num_document_chunks)
+        return neighbor_hidden_states
+
+    def preret_encode(self,
+                      hidden_states: torch.Tensor,
+                      attention_mask: torch.Tensor,
+                      deterministic: bool,
+                      output_attentions: bool = False, ):
+        original_hidden_states_shape = hidden_states.shape
+        original_attention_mask_shape = attention_mask.shape
+
+        # TODO: verify equivilance
+        original_hidden_states = einops.rearrange(hidden_states, 'b l (c d) -> (b l) c d', c=self.config.chunk_size)
+
+        attention_mask = attention_mask.unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
+
+        attention_mask = einops.rearrange(attention_mask, 'b l d -> (b l) d')
+
+        # add a chunk dimension
+        # 1. apply bi-dir attention
+        preret_bi_output = self.preret_bidir_attention.forward(
+            self.preret_bi_attention_norm(original_hidden_states),
+            attention_mask=attention_mask,
+            deterministic=deterministic,
+            output_attentions=output_attentions)
+        encoded_hidden_states = preret_bi_output[0] + original_hidden_states
+
+        # 2. pool
+        pooled_hidden_states = encoded_hidden_states.mean(dim=-2)
+
+        # 3. project to query chunks and key chunks
+        key_chunks = self.key_projection.forward(self.pre_key_norm.forward(pooled_hidden_states))
+        query_chunks = self.query_projection.forward(self.pre_query_norm.forward(pooled_hidden_states))
+        chunk_mask = attention_mask.type(bool).any(-1)[..., None]
+        original_hidden_states = original_hidden_states.reshape(original_hidden_states_shape)
+        attention_mask = attention_mask.reshape(original_attention_mask_shape)
+
+        return FlaxRPTRetrieverEncodedOutput(
+            original_hidden_states=original_hidden_states,
+            encoded_hidden_states=encoded_hidden_states,
+            attention_mask=attention_mask,
+            key_chunks=key_chunks,
+            query_chunks=query_chunks,
+            chunk_mask=chunk_mask,
+            preret_attention=preret_bi_output[1:])
+
+    def apply_scheduled_sampling(self,
+                                 query_score_based_idx: torch.Tensor,
+                                 chunk_mask: torch.Tensor,
+                                 target_score_based_idx: torch.Tensor,
+                                 target_neighbor_mask: torch.Tensor,
+                                 train_step,
+                                 deterministic):
+        if deterministic or self.is_initializing() or target_score_based_idx is None:
+            top_nei_idx, top_nei_mask = query_score_based_idx, chunk_mask
+        else:
+
+            # TODO: figure it out, might not be relevant due to inference only code
+            rv = torch.bernoulli(p=self.scheduled_sampling_schedule_fn(train_step if not self.is_initializing() else 1),
+                                      shape=())  # this is a boolean of shape [1]
+            top_nei_idx, top_nei_mask = jax.lax.cond(rv,
+                                                     (), lambda args: (query_score_based_idx, chunk_mask),
+                                                     (), lambda args: (target_score_based_idx, target_neighbor_mask)
+                                                     )
+        return top_nei_idx, top_nei_mask
+
+    def get_loss_scale(self, train_step):
+        loss_scale = self.aux_loss_schedule_fn(train_step if not self.is_initializing() else 1)
+        return loss_scale * self.aux_scale
+# loss is calculated as lm_loss + (raw_aux_loss/valid_pairs.sum())* self.get_loss_scale(train_step)
+
+class FlaxRPTModule(nn.Module):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32):
+        super().__init__()
+        self.config = config
+        self.dtype = dtype
+        # the embedding dim
+        self.embed_dim = self.config.hidden_size
+
+        # TODO: move this wte and dropout into the lowcoder.
+
+        # define a dropout layer
+        self.dropout = nn.Dropout(p=self.config.embd_pdrop)
+
+        # TODO: handle init
+        self.wte = nn.Embedding(
+            self.config.vocab_size,  # input size
+            self.config.hidden_size,  # embedding size
+            dtype=self.dtype
+        )
+
+        """
+        # word to embedding module (layer)
+        self.wte = nn.Embed(
+            self.config.vocab_size,  # input size
+            self.config.hidden_size,  # embedding size
+            embedding_init=dense_init(self.config, is_embedding=True),
+            # basically np.random of weights in the correct size
+            dtype=self.dtype,  # type of embedding vector entries
+            param_dtype=self.param_dtype,  # type of input
+        )
+        """
+
+        self.lowcoder = TorchRPTLowcoder(self.config, dtype=self.dtype)
+        if self.config.cca_freq is not None and self.config.cca_freq > 0:
+            self.retriever = FlaxRPTRetriever(self.config, dtype=self.dtype)
+        else:
+            self.retriever = None
+
+        self.upcoder = FlaxRPTUpcoder(self.config, dtype=self.dtype)
+
+        # TODO: move this ln_f into the upcoder.
+        self.ln_f = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+
+    # TODO: Handle
+    def _concatenate_to_lowcoder_cache(self, array):
+        chunk_size = self.config.chunk_size
+        is_initialized = self.has_variable("cache", "cached_array")
+        *batch_dims, _, hidden_dim = array.shape
+        cached_array = self.variable("cache", "cached_array",
+                                     jnp.zeros,
+                                     tuple(batch_dims) + (self.config.chunk_size, hidden_dim),
+                                     array.dtype)
+        if is_initialized:
+            last_chunk = array[..., -chunk_size:, :]
+
+            num_updated_cache_vectors = last_chunk.shape[-2]
+            shift = self.config.chunk_size - num_updated_cache_vectors  # will need to update if I change retrieval stride
+            indices = (0,) * len(batch_dims) + (shift, 0)
+
+            array_operand = torch.roll(cached_array.value, shift=-num_updated_cache_vectors, axis=-2)
+            cached_array.value = lax.dynamic_update_slice(array_operand,
+                                                          last_chunk,
+                                                          indices)
+
+    def forward(
+            self,
+            input_ids,
+            attention_mask,
+            position_ids,
+            deterministic=True,
+            retriever_supervision: RetrieverSupervision = None,
+            train_step: Optional[int] = None,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+            upcoder_input=None,
+            encoded_neighbors: Optional[EncodedNeighbors] = None,
+    ):
+        lowcoder_outputs = None
+        retriever_output = None
+        neighbor_hidden_states = None
+        neighbor_mask = None
+        chunk_index = None
+        retriever_input = None
+
+        if upcoder_input is None:
+            input_embeds = self.wte.forward(input_ids.astype("i4"))
+
+            # TODO: Determinsitc
+            hidden_states = self.dropout.forward(input_embeds)
+
+            lowcoder_outputs = self.lowcoder.forward(
+                hidden_states,
+                attention_mask,
+                position_ids=position_ids,
+                deterministic=deterministic,
+                init_cache=init_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
+            hidden_states = lowcoder_outputs.last_hidden_state if return_dict else lowcoder_outputs[0]
+            if self.has_variable("cache", "cached_array") or init_cache:
+                self._concatenate_to_lowcoder_cache(hidden_states)
+
+            retriever_input = hidden_states
+            if self.retriever is not None:
+                if encoded_neighbors is not None:
+                    neighbor_hidden_states = encoded_neighbors.neighbor_hidden_states
+                    neighbor_mask = encoded_neighbors.neighbor_mask
+                    chunk_index = encoded_neighbors.chunk_index
+                else:
+                    retriever_output = self.retriever.forward(hidden_states=retriever_input,
+                                                      attention_mask=attention_mask,
+                                                      retriever_supervision=retriever_supervision,
+                                                      deterministic=deterministic,
+                                                      train_step=train_step)
+                    neighbor_hidden_states = retriever_output.neighbor_hidden_states
+                    neighbor_mask = retriever_output.neighbor_mask
+        else:
+            hidden_states = upcoder_input.hidden_states
+            attention_mask = upcoder_input.attention_mask
+            neighbor_hidden_states = upcoder_input.neighbor_hidden_states
+            neighbor_mask = upcoder_input.neighbor_mask
+
+        upcoder_outputs = self.upcoder.forward(
+            hidden_states,
+            attention_mask,
+            position_ids=position_ids,
+            neighbor_hidden_states=neighbor_hidden_states,
+            neighbor_mask=neighbor_mask,
+            chunk_index=chunk_index,
+            deterministic=deterministic,
+            init_cache=init_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = upcoder_outputs.last_hidden_state if return_dict else upcoder_outputs[0]
+        hidden_states = self.ln_f.forward(hidden_states)
+
+        if not return_dict:
+            return (hidden_states,) + upcoder_outputs + lowcoder_outputs
+
+        return FlaxRPTModelOutput(
+            last_hidden_state=upcoder_outputs.last_hidden_state,
+            upcoder_hidden_states=upcoder_outputs.hidden_states,
+            upcoder_attentions=upcoder_outputs.attentions,
+            cross_attentions=None,
+            lowcoder_last_hidden_state=lowcoder_outputs.last_hidden_state if lowcoder_outputs is not None else None,
+            lowcoder_hidden_states=lowcoder_outputs.hidden_states if lowcoder_outputs is not None else None,
+            lowcoder_attentions=lowcoder_outputs.attentions if lowcoder_outputs is not None else None,
+            retriever_output=retriever_output,
+            retriever_input=retriever_input,
+        )
