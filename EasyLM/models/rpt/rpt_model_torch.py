@@ -382,9 +382,9 @@ class TorchRPTRMSNorm(nn.Module):
         self.dtype = dtype
         self.eps = self.config.rms_norm_eps
         if self.config.rms_one_baseline:
-            self.weight = nn.Parameter(torch.zeros(self.config.hidden_size, dtype=self.param_dtype))
+            self.weight = nn.Parameter(torch.zeros(self.config.hidden_size))
         else:
-            self.weight = nn.Parameter(torch.ones(self.config.hidden_size, dtype=self.param_dtype))
+            self.weight = nn.Parameter(torch.ones(self.config.hidden_size))
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(torch.square(x).mean(-1, keepdim=True) + self.eps)
@@ -997,9 +997,8 @@ class TorchRPTLowcoderLayer(nn.Module):
         attn_outputs = self.attention.forward(
             self.attention_norm(hidden_states),
             attention_mask,
-            position_ids,
             deterministic,
-            #init_cache, # TODO: caching and stuff
+            init_cache, # TODO: caching and stuff
             output_attentions,
             fcm_mask,
             sliding_window=self.config.sliding_window,

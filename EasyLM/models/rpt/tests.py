@@ -39,7 +39,6 @@ def test_rms_norm():
     flax_rms_norm = rpt_model.FlaxRPTRMSNorm(rpt_config, dtype=jnp.float32, param_dtype=jnp.float32)
     torch_rms_norm = rpt_model_torch.TorchRPTRMSNorm(rpt_config, dtype=torch.float32, param_dtype=torch.float32)
 
-
     arr = np.zeros(4096)
     arr[:3] = [1, 2, 3]
 
@@ -119,4 +118,55 @@ def test_mlp():
     np.testing.assert_almost_equal(torch_result[0].detach().numpy(), flax_result[0][0], decimal=0)
 
 
-test_mlp()
+def test_lowcoder():
+    input_ids = np.ones(1024, dtype=int)
+    input_ids[:3] = [1, 2, 3]
+    seq_length = input_ids.shape[0]
+    batch_size = 1
+    attention_mask = jnp.ones_like(input_ids)
+    position_ids = jnp.broadcast_to(
+        jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
+        (batch_size, seq_length)
+    )
+
+    wte = flax.linen.Embed(
+        rpt_config.vocab_size,  # input size
+        rpt_config.hidden_size,  # embedding size
+        embedding_init=rpt_model.dense_init(rpt_config, is_embedding=True),  # basically np.random of weights in the correct size
+        dtype=jnp.float32,  # type of embedding vector entries
+        param_dtype=jnp.float32,  # type of input
+    )
+
+    hidden_states = wte.init_with_output(jax.random.PRNGKey(42), input_ids)
+
+    lowcoder = rpt_model.FlaxRPTLowcoder(rpt_config, dtype=jnp.float32)
+
+    """
+    lowcoder_outputs = lowcoder.init_with_output(jax.random.PRNGKey(42),
+        jnp.array([hidden_states[0]]),
+        attention_mask,
+        position_ids=position_ids,
+        deterministic=True,
+        init_cache=False,
+        output_attentions=False,
+        output_hidden_states=False,
+        return_dict=False,
+    )
+
+    print(lowcoder_outputs)
+    """
+
+    lowcoder_torch = rpt_model_torch.TorchRPTLowcoderLayer(rpt_config, dtype=torch.float32)
+    lowcoder_torch_output = lowcoder_torch.forward(
+        torch.Tensor(np.array([hidden_states[0]])),
+        torch.Tensor(np.array(attention_mask)),
+        position_ids=torch.Tensor(np.array(position_ids)),
+        deterministic=True,
+        init_cache=False,
+        output_attentions=False,
+    )
+
+    print(lowcoder_torch_output)
+
+
+test_lowcoder()
