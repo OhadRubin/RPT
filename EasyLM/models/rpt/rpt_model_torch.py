@@ -1224,6 +1224,9 @@ class FlaxRPTUpcoderLayer(nn.Module):
 
     def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, has_cca: bool = False):
         super().__init__()
+        self.config = config
+        self.dtype = dtype
+        self.has_cca = has_cca
         if self.has_cca:
             self.cca = TorchRPTChunkedCrossAttention(
                 self.config,
@@ -1266,10 +1269,9 @@ class FlaxRPTUpcoderLayer(nn.Module):
     ):
 
         print(f"In Upcoder Layer: Using CCA: {self.has_cca}")
-        attn_outputs = self.attention(
+        attn_outputs = self.attention.forward(
             self.attention_norm(hidden_states),
             attention_mask,
-            position_ids,
             deterministic,
             init_cache,
             output_attentions,
@@ -1281,9 +1283,9 @@ class FlaxRPTUpcoderLayer(nn.Module):
 
         if self.cca is not None and neighbor_hidden_states is not None:
             if self.cca_norm2 is not None:
-                neighbor_hidden_states = self.cca_norm2(neighbor_hidden_states)
+                neighbor_hidden_states = self.cca_norm2.forward(neighbor_hidden_states)
 
-            cca_output = self.cca(hidden_states=self.cca_norm(hidden_states),
+            cca_output = self.cca(hidden_states=self.cca_norm.forward(hidden_states),
                                   neighbor_hidden_states=neighbor_hidden_states,
                                   neighbor_mask=neighbor_mask,
                                   position_ids=chunk_index,
@@ -1294,7 +1296,7 @@ class FlaxRPTUpcoderLayer(nn.Module):
             cca_hidden_states = cca_output[0]
             hidden_states = cca_hidden_states + hidden_states
 
-        feed_forward_input = self.ffn_norm(hidden_states)
+        feed_forward_input = self.ffn_norm.forward(hidden_states)
 
         if self.config.scan_mlp:
             feed_forward_input = einops.rearrange(
@@ -1321,9 +1323,8 @@ class FlaxRPTUpcoderLayer(nn.Module):
                 '... b s d -> ... (b s) d'
             )
         else:
-            feed_forward_hidden_states = self.feed_forward(
+            feed_forward_hidden_states = self.feed_forward.forward(
                 feed_forward_input,
-                deterministic,
             )
 
         hidden_states = hidden_states + feed_forward_hidden_states
@@ -1711,7 +1712,7 @@ class FlaxRPTRetriever(nn.Module):
             deterministic)
         neighbor_hidden_states = self.lookup_neighbor_states(encoded_output.encoded_hidden_states, top_nei_idx)
         # TODO: fishy unsqueeze
-        nei_mask = torch.broadcast_to(nei_mask.unsqueeze(), neighbor_hidden_states.shape[:-1])
+        nei_mask = torch.broadcast_to(nei_mask.unsqueeze(0), neighbor_hidden_states.shape[:-1])
         return FlaxRPTRetrieverNeighborOutput(aux_loss=aux_loss if aux_loss is not None else None,
                                               loss_scale=self.get_loss_scale(
                                                   train_step) if aux_loss is not None else None,
