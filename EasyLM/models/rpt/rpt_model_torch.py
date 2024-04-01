@@ -1012,6 +1012,7 @@ class TorchRPTLowcoderLayer(nn.Module):
         # nomalize hidden states
         feed_forward_input = self.ffn_norm.forward(hidden_states)
 
+        # TODO: is this syntax or is it real?
         # run the nomlaized hidden states into the MLP
         if self.config.scan_mlp:
             feed_forward_input = einops.rearrange(
@@ -1037,12 +1038,8 @@ class TorchRPTLowcoderLayer(nn.Module):
                 '... b s d -> ... (b s) d'
             )
         else:
-            feed_forward_hidden_states = self.feed_forward.forward(
-                feed_forward_input,
-                deterministic,
-            )
+            feed_forward_hidden_states = self.feed_forward.forward(feed_forward_input)
 
-        # E: Add the goddamn linear layer output to the hidden states?
         hidden_states = hidden_states + feed_forward_hidden_states
 
         # what's on attn_output[1:]??
@@ -1343,12 +1340,6 @@ class FlaxRPTUpcoderLayerCollection(nn.Module):
         super().__init__(*args, **kwargs)
         self.config = config
         self.dtype = dtype
-        block = FlaxRPTUpcoderLayer
-        if self.config.remat_block != '':
-            block = remat(
-                FlaxRPTUpcoderLayer, static_argnums=(6, 7, 8, 9),
-                policy=get_gradient_checkpoint_policy(self.config.remat_block)
-            )
         assert (self.config.num_hidden_layers % 2) == 0, f"config.num_hidden_layers should be divisible by 2"
         num_hidden_layers = self.config.num_hidden_layers // 2
         print("In Upcoder: Using {} layers".format(num_hidden_layers))
@@ -1359,7 +1350,7 @@ class FlaxRPTUpcoderLayerCollection(nn.Module):
             return (layer_index % self.config.cca_freq) == 0
 
         self.blocks = [
-            block(
+            FlaxRPTUpcoderLayer(
                 self.config,
                 dtype=self.dtype,
                 has_cca=has_cca(i),
