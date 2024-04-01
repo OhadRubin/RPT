@@ -119,8 +119,8 @@ def m1_cosine_decay_schedule(
   if not decay_steps > 0:
     raise ValueError('The cosine_decay_schedule requires positive decay_steps!')
   def schedule(count):
-    count = jnp.minimum(count, decay_steps)
-    cosine_decay = 0.5 * (1 + jnp.cos(jnp.pi * count / decay_steps))
+    count = torch.min(count, decay_steps)
+    cosine_decay = 0.5 * (1 + torch.cos(torch.pi * count / decay_steps))
     decayed = 1-(cosine_decay ** exponent)
     decayed = (1 - min_value) * decayed + min_value
     return max_value*decayed
@@ -132,7 +132,7 @@ def topk_chunks(retriever_scores,num_candidates,*,where=None):
     def _topk_chunks(retriever_scores):
         return (-retriever_scores).argsort()[:num_candidates] #k = num_candidates
     if where is not None:
-        retriever_scores = jnp.where(where,retriever_scores,-jnp.inf)
+        retriever_scores = torch.where(where,retriever_scores,-torch.inf)
     return _topk_chunks(retriever_scores)
 
 def create_segment_mask(total_num_chunks,n_skip_chunks):
@@ -140,8 +140,8 @@ def create_segment_mask(total_num_chunks,n_skip_chunks):
     # TODO: This used to have a @jax.vmap annotation on it, let's pytorch it
     def _create_segment_mask(chunk_index):
         max_chunk = n_skip_chunks*(chunk_index//n_skip_chunks)
-        return jnp.arange(total_num_chunks)<max_chunk - 2
-    return _create_segment_mask(jnp.arange(total_num_chunks))
+        return torch.arange(total_num_chunks)<max_chunk - 2
+    return _create_segment_mask(torch.arange(total_num_chunks))
 
 
 @gin.configurable
@@ -816,8 +816,12 @@ class TorchRPTCrossAttention(nn.Module):
             dtype=self.dtype,
         )
         # TODO: Fishy. including the other initialization and null attention
-        self.null_k = self.param(f'null_k', torch.nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
-        self.null_v = self.param(f'null_v', torch.nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
+        # TODO: Hachasha
+        #self.null_k = self.param(f'null_k', torch.nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
+        #self.null_v = self.param(f'null_v', torch.nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
+        self.null_k = torch.nn.init.normal_(torch.empty((1, 1, self.num_heads, self.head_dim)), std=0.0001)
+        self.null_v = torch.nn.init.normal_(torch.empty((1, 1, self.num_heads, self.head_dim)), std=0.0001)
+
 
     def _split_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
@@ -834,14 +838,14 @@ class TorchRPTCrossAttention(nn.Module):
             attention_mask: Optional[torch.Tensor] = None,
             output_attentions: bool = False,
             deterministic: bool = True,
-    ) -> Tuple[torch.ndarray]:
+    ) -> Tuple[torch.Tensor]:
 
         is_cross_attention = key_value_states is not None
 
         if not is_cross_attention:
-            xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
+            xq, xk, xv = self.wq.forward(hidden_states), self.wk.forward(hidden_states), self.wv.forward(hidden_states)
         else:
-            xq, xk, xv = self.wq(hidden_states), self.wk(key_value_states), self.wv(key_value_states)
+            xq, xk, xv = self.wq.forward(hidden_states), self.wk.forward(key_value_states), self.wv.forward(key_value_states)
 
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
@@ -893,14 +897,14 @@ class TorchRPTCrossAttention(nn.Module):
             dropout_rng = self.make_rng("dropout")
 
         attn_weights = dot_product_attention_weights(
-            xq,
-            xk,
+            jnp.array(xq.detach().numpy()),
+            jnp.array(xk.detach().numpy()),
             bias=attention_bias,
             dropout_rng=dropout_rng,
             dropout_rate=self.config.attn_pdrop,
             deterministic=deterministic,
             dtype=jnp.float32,
-            precision=self.precision,
+            precision='default',
         )
         attn_weights = torch.Tensor(attn_weights.tolist())
 
@@ -915,32 +919,35 @@ class TorchRPTCrossAttention(nn.Module):
 
 class TorchRPTMLP(nn.Module):
 
-    def __init__(self, config: RPTConfig, dtype: torch.float32, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, config: RPTConfig, dtype: torch.float32):
+        super().__init__()
         self.config = config
         self.dtype = dtype
 
         # TODO: Don't forget to initialize
         self.w1 = nn.Linear(
-            config.intermediate_size if config.gated_ff else 4 * config.hidden_size,
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size if config.gated_ff else 4 * config.hidden_size,
             dtype=self.dtype,
             bias=False,
         )
         self.w2 = nn.Linear(
-            config.hidden_size,
+            in_features=self.w1.out_features,
+            out_features=config.hidden_size,
             dtype=self.dtype,
             bias=False,
         )
         if self.config.gated_ff:
             self.w3 = nn.Linear(
-                config.intermediate_size,
+                in_features=config.hidden_size,
+                out_features=config.intermediate_size,
                 dtype=self.dtype,
                 bias=False,
             )
-        # TODO: WHAT IS THIS??
-        self.dropout = nn.Dropout(p=self.config.resid_pdrop, broadcast_dims=(0,))
 
-    def forward(self, x: torch.Tensor, deterministic: bool = True) -> torch.Tensor:
+        self.dropout = nn.Dropout(p=self.config.resid_pdrop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.config.gated_ff:
             x1 = torch.silu(self.w1(x))
             x3 = self.w3(x)
@@ -950,10 +957,10 @@ class TorchRPTMLP(nn.Module):
                 x = x1 * x3
             x = self.w2(x)
 
-            x = self.dropout(x, deterministic=deterministic)
+            x = self.dropout(x)
         else:
             x = torch.gelu(self.w1(x))
-            x = self.dropout(x, deterministic=deterministic)
+            x = self.dropout(x)
             x = self.w2(x)
 
         return x
@@ -965,29 +972,16 @@ class TorchRPTLowcoderLayer(nn.Module):
         super().__init__(*args, **kwargs)
         self.config = config
         self.dtype = dtype
-        attention_module = TorchRPTAttention
-        if self.config.remat_attention != '':
-            attention_module = remat(
-                TorchRPTAttention, static_argnums=(3, 4, 5, -1),
-                policy=get_gradient_checkpoint_policy(self.config.remat_attention)
-            )
-        self.attention = attention_module(
+        self.attention = TorchRPTAttention(
             self.config,
             dtype=self.dtype,
         )
-        mlp_module = TorchRPTMLP
-        if self.config.remat_mlp != '':
-            mlp_module = remat(
-                TorchRPTMLP, static_argnums=(1,),
-                policy=get_gradient_checkpoint_policy(self.config.remat_mlp)
-            )
-
-        self.feed_forward = mlp_module(
+        self.feed_forward = TorchRPTMLP(
             self.config,
             dtype=self.dtype
         )
-        self.attention_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
-        self.ffn_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype, param_dtype=self.param_dtype)
+        self.attention_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype)
+        self.ffn_norm = TorchRPTRMSNorm(self.config, dtype=self.dtype)
 
     def forward(
             self,
@@ -1000,22 +994,23 @@ class TorchRPTLowcoderLayer(nn.Module):
             fcm_mask: Optional[torch.Tensor] = None,
     ):
         # run self attention on the hidden states
-        attn_outputs = self.attention(
+        attn_outputs = self.attention.forward(
             self.attention_norm(hidden_states),
             attention_mask,
             position_ids,
             deterministic,
-            init_cache,
+            #init_cache, # TODO: caching and stuff
             output_attentions,
             fcm_mask,
             sliding_window=self.config.sliding_window,
         )
 
+        # TODO: check
         attn_output = attn_outputs[0]
         hidden_states = hidden_states + attn_output
 
         # nomalize hidden states
-        feed_forward_input = self.ffn_norm(hidden_states)
+        feed_forward_input = self.ffn_norm.forward(hidden_states)
 
         # run the nomlaized hidden states into the MLP
         if self.config.scan_mlp:
@@ -1042,7 +1037,7 @@ class TorchRPTLowcoderLayer(nn.Module):
                 '... b s d -> ... (b s) d'
             )
         else:
-            feed_forward_hidden_states = self.feed_forward(
+            feed_forward_hidden_states = self.feed_forward.forward(
                 feed_forward_input,
                 deterministic,
             )
@@ -1064,11 +1059,6 @@ class TorchRPTLowcoderLayerCollection(nn.Module):
         self.config = config
         self.dtype = dtype
         block = TorchRPTLowcoderLayer
-        if self.config.remat_block != '':
-            block = remat(
-                TorchRPTLowcoderLayer, static_argnums=(3, 4, 5),
-                policy=get_gradient_checkpoint_policy(self.config.remat_block)
-            )
         assert (self.config.num_hidden_layers % 2) == 0, f"config.num_hidden_layers should be devisible by 2"
         num_hidden_layers = self.config.num_hidden_layers // 2
         print("In Lowcoder: Using {} layers".format(num_hidden_layers))
@@ -1100,7 +1090,7 @@ class TorchRPTLowcoderLayerCollection(nn.Module):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = block(
+            layer_outputs = block.forward(
                 hidden_states,
                 attention_mask,
                 position_ids,
@@ -1109,8 +1099,10 @@ class TorchRPTLowcoderLayerCollection(nn.Module):
                 output_attentions,
                 fcm_mask,
             )
+            # TODO: Is this not useful?
             hidden_states = layer_outputs[0]
 
+            # TODO: Is this not useful?
             if output_attentions:
                 all_attentions += (layer_outputs[1],)
         if output_hidden_states:
@@ -1238,12 +1230,6 @@ class FlaxRPTUpcoderLayer(nn.Module):
     def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, has_cca: bool = False):
         super(FlaxRPTUpcoderLayer, self)
 
-        attention_module = TorchRPTAttention
-        if self.config.remat_attention != '':
-            attention_module = remat(
-                TorchRPTAttention, static_argnums=(3, 4, 5, -1),
-                policy=get_gradient_checkpoint_policy(self.config.remat_attention)
-            )
         if self.has_cca:
             self.cca = TorchRPTChunkedCrossAttention(
                 self.config,
@@ -1259,18 +1245,12 @@ class FlaxRPTUpcoderLayer(nn.Module):
             self.cca = None
             self.cca_norm = None
 
-        self.attention = attention_module(
+        self.attention = TorchRPTAttention(
             self.config,
             dtype=self.dtype
         )
-        mlp_module = TorchRPTMLP
-        if self.config.remat_mlp != '':
-            mlp_module = remat(
-                TorchRPTMLP, static_argnums=(1,),
-                policy=get_gradient_checkpoint_policy(self.config.remat_mlp)
-            )
 
-        self.feed_forward = mlp_module(
+        self.feed_forward = TorchRPTMLP(
             self.config,
             dtype=self.dtype
         )

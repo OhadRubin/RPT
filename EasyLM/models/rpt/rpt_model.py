@@ -835,7 +835,6 @@ class FlaxRPTAttention(nn.Module):
         n_windows=self.config.n_windows
         # stride = self.config.stride if not disable_cache else None
 
-        # (1x1024,4096) = (??,input size,embedding_dim)
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
         xq = self._split_heads(xq)
