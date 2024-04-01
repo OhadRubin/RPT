@@ -13,7 +13,7 @@ from ml_collections import ConfigDict
 from typing import Optional, Tuple, Union, Dict
 from transformers import AutoTokenizer
 from einops import rearrange
-from torch_utils import make_attention_mask, make_causal_mask, combine_masks
+from torch_utils import make_attention_mask, make_causal_mask, combine_masks, gelu, silu
 from dataclasses import dataclass
 
 import jax
@@ -949,7 +949,7 @@ class TorchRPTMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.config.gated_ff:
-            x1 = torch.silu(self.w1(x))
+            x1 = silu(self.w1(x))
             x3 = self.w3(x)
             if self.config.mult_in_complex:
                 x = mult_in_complex(x1, x3)
@@ -959,7 +959,7 @@ class TorchRPTMLP(nn.Module):
 
             x = self.dropout(x)
         else:
-            x = torch.gelu(self.w1(x))
+            x = gelu(self.w1(x))
             x = self.dropout(x)
             x = self.w2(x)
 
@@ -1055,12 +1055,11 @@ class TorchRPTLowcoderLayerCollection(nn.Module):
         super().__init__(*args, **kwargs)
         self.config = config
         self.dtype = dtype
-        block = TorchRPTLowcoderLayer
         assert (self.config.num_hidden_layers % 2) == 0, f"config.num_hidden_layers should be devisible by 2"
         num_hidden_layers = self.config.num_hidden_layers // 2
         print("In Lowcoder: Using {} layers".format(num_hidden_layers))
         self.blocks = [
-            block(
+            TorchRPTLowcoderLayer(
                 self.config,
                 dtype=self.dtype,
                 param_dtype=self.param_dtype
@@ -1134,7 +1133,7 @@ class TorchRPTLowcoder(nn.Module):
             output_hidden_states: bool = False,
             return_dict: bool = True,
     ):
-        outputs = self.layers(
+        outputs = self.layers.forward(
             hidden_states,
             attention_mask,
             position_ids=position_ids,
@@ -1225,8 +1224,7 @@ class TorchRPTChunkedCrossAttention(nn.Module):
 class FlaxRPTUpcoderLayer(nn.Module):
 
     def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, has_cca: bool = False):
-        super(FlaxRPTUpcoderLayer, self)
-
+        super().__init__()
         if self.has_cca:
             self.cca = TorchRPTChunkedCrossAttention(
                 self.config,

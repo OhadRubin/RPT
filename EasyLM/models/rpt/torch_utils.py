@@ -30,3 +30,9 @@ def combine_masks(*masks, dtype=torch.bool):
         mask = torch.logical_and(mask, other_mask)
 
     return mask.type(dtype)
+
+def gelu(x):
+    return 0.5 * x * (1 + torch.tanh(torch.sqrt(2 / torch.pi) * (x + 0.044715 * torch.pow(x, 3))))
+
+def silu(x):
+    return x * torch.sigmoid(x)
