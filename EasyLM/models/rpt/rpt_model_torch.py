@@ -1334,8 +1334,8 @@ class FlaxRPTUpcoderLayer(nn.Module):
 
 class FlaxRPTUpcoderLayerCollection(nn.Module):
 
-    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32):
+        super().__init__()
         self.config = config
         self.dtype = dtype
         assert (self.config.num_hidden_layers % 2) == 0, f"config.num_hidden_layers should be divisible by 2"
@@ -1377,7 +1377,7 @@ class FlaxRPTUpcoderLayerCollection(nn.Module):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            layer_outputs = block(
+            layer_outputs = block.forward(
                 hidden_states,  # 0
                 attention_mask,  # 1
                 position_ids,  # 2
@@ -1593,7 +1593,7 @@ class FlaxRPTUpcoder(nn.Module):
             )
         # else We are generating... And have already augmented the neighbor hidden states.
 
-        outputs = self.layers(
+        outputs = self.layers.forward(
             hidden_states,
             attention_mask,
             position_ids=position_ids,
