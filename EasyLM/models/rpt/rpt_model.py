@@ -717,13 +717,11 @@ class FlaxRPTAttention(nn.Module):
 
         # self.resid_dropout = nn.Dropout(rate=config.resid_pdrop,broadcast_dims=(0,))
 
-        # TODO: Bruh mask (not actually masking anything)
         self.causal_mask = make_causal_mask(jnp.ones((1, config.max_sequence_length), dtype="bool"), dtype="bool")
         if self.config.rot_dim is not None and self.config.rot_dim>0:
             rot_dim = self.config.rot_dim
         else:
             rot_dim = self.head_dim
-        # E: positional encoding
         self.freqs_cis = precompute_freqs_cis(
             rot_dim,
             config.max_sequence_length * 2,
@@ -837,6 +835,8 @@ class FlaxRPTAttention(nn.Module):
 
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
+        # xq = torch.Size([1, 1024, 2048]) -> torch.Size([1, 1024, 16, 128])
+        # xq = (1, 2048, 2048) -> (1, 2048, 16, 128)
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
         xv = self._split_heads(xv)
@@ -1112,7 +1112,7 @@ class FlaxRPTCrossAttention(nn.Module):
         null_v = jnp.broadcast_to(self.null_v, (batch_size, 1, self.num_heads, self.head_dim))
         xv = jnp.concatenate((xv, null_v), axis = -3)
         
-                
+        # attention_mask = (16, 64)
         if attention_mask is not None:
             
             null_mask = jnp.ones((attention_mask.shape[0], 1), dtype=jnp.float32)
@@ -1274,6 +1274,8 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
         init_variables = self.module.init(
             jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
         )
+
+        # cache contains the structure of the transformer -> lowcoder, upcoder and a cached array (1, 64, 2048)
         return init_variables["cache"]
 
     @add_start_docstrings_to_model_forward("")
@@ -1422,7 +1424,7 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
                 attention_mask=attention_mask,
                 deterministic=not train,
                 output_attentions=output_attentions,
-                method=self.module._lowcoder_forward,
+                method=self.module._lowcod_lowcoder_forwarder_forward,
                 **apply_kwargs       
         )
         return outputs, unfreeze(past_key_values["cache"]), past_key_values.get("intermediates",None)
@@ -1568,7 +1570,6 @@ class FlaxRPTLowcoderLayer(nn.Module):
     def setup(self) -> None:
         attention_module = FlaxRPTAttention
         if self.config.remat_attention != '':
-            # E: repeat function a ton of times for some reason
             attention_module = remat(
                 FlaxRPTAttention, static_argnums=(3, 4, 5,-1),
                 policy=get_gradient_checkpoint_policy(self.config.remat_attention)
@@ -1654,7 +1655,6 @@ class FlaxRPTLowcoderLayer(nn.Module):
                 deterministic,
             )
 
-        # E: Add the goddamn linear layer output to the hidden states?
         hidden_states = hidden_states + feed_forward_hidden_states
 
         # what's on attn_output[1:]??
@@ -1817,7 +1817,7 @@ class FlaxRPTChunkedCrossAttention(nn.Module):
         neighbor_hidden_states = neighbor_hidden_states.reshape([-1, 2*chunk_size*num_neighbors, hidden_dim])
         neighbor_mask = neighbor_mask.reshape([-1, 2*chunk_size*num_neighbors])
         local_device_count = hidden_states.shape[0]
-        if num_document_chunks>1:
+        if num_document_chunks > 1:
             num_devices_chunks = num_document_chunks//local_device_count
             # ->  (-1 ,chunk_size, hidden_dim)
             hidden_states = hidden_states.reshape([-1, num_devices_chunks*chunk_size, hidden_dim])
@@ -2424,9 +2424,9 @@ class FlaxRPTRetriever(nn.Module):
                output_attentions: bool = False,):
         original_hidden_states_shape = hidden_states.shape
         original_attention_mask_shape = attention_mask.shape
-        
+
         original_hidden_states, attention_mask = jax.tree_map(
-                lambda x: einops.rearrange(x, 'b (l c) ... -> (b l) c ... ', c=self.config.chunk_size), 
+                lambda x: einops.rearrange(x, 'b (l c) ... -> (b l) c ... ', c=self.config.chunk_size),
                 (hidden_states, attention_mask)
                 ) # add a chunk dimension
         #1. apply bi-dir attention 
@@ -2612,8 +2612,9 @@ class FlaxRPTModule(nn.Module):
 
             hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
+            # (1. 1024, 2048)
             lowcoder_outputs = self.lowcoder(
-                hidden_states,
+                hidden_states, # (1, 1024, 2048)
                 attention_mask,
                 position_ids=position_ids,
                 deterministic=deterministic,
@@ -2640,8 +2641,8 @@ class FlaxRPTModule(nn.Module):
                                                     retriever_supervision=retriever_supervision,
                                                     deterministic=deterministic,
                                                     train_step=train_step)
-                    neighbor_hidden_states = retriever_output.neighbor_hidden_states
-                    neighbor_mask = retriever_output.neighbor_mask     
+                    neighbor_hidden_states = retriever_output.neighbor_hidden_states # (16, 2, 128, 2048)
+                    neighbor_mask = retriever_output.neighbor_mask # (16, 2, 128)
         else:
             hidden_states = upcoder_input.hidden_states
             attention_mask = upcoder_input.attention_mask
@@ -2649,7 +2650,7 @@ class FlaxRPTModule(nn.Module):
             neighbor_mask = upcoder_input.neighbor_mask
         
         
-        upcoder_outputs = self.upcoder(
+        upcoder_outputs = self.upcoder( # (1,1024, 2048)
             hidden_states,
             attention_mask,
             position_ids=position_ids,
@@ -2828,7 +2829,6 @@ class FlaxRPTForCausalLMModule(nn.Module):
 @add_start_docstrings("", "")
 class FlaxRPTForCausalLM(FlaxRPTPreTrainedModel):
     module_class = FlaxRPTForCausalLMModule
-
     def prepare_inputs_for_generation(self, input_ids,
                                       max_length,
                                       attention_mask = None,
@@ -2846,7 +2846,7 @@ class FlaxRPTForCausalLM(FlaxRPTPreTrainedModel):
             "attention_mask": attention_mask,
         }
 
-    def update_inputs_for_genxeration(self, model_outputs, model_kwargs):
+    def update_inputs_for_generation(self, model_outputs, model_kwargs):
         model_kwargs["past_key_values"] = model_outputs.past_key_values
         
         if model_kwargs.get("encoded_neighbors", None) is not None:

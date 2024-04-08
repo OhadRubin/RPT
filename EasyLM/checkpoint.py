@@ -206,6 +206,11 @@ class StreamingCheckpointer(object):
             restored_params = flax.core.frozen_dict.freeze(
                 {'params': restored_params}
             )
+        elif load_type == 'safetensors':
+            cls.load_torch_checkpoint(
+                path=load_path,
+                params_target=params_target
+            )
         else:
             raise ValueError(f'Invalid load_from type: {load_type}')
 

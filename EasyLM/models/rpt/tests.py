@@ -37,7 +37,7 @@ rpt_config = RPTConfig(
 
 def test_rms_norm():
     flax_rms_norm = rpt_model.FlaxRPTRMSNorm(rpt_config, dtype=jnp.float32, param_dtype=jnp.float32)
-    torch_rms_norm = rpt_model_torch.TorchRPTRMSNorm(rpt_config, dtype=torch.float32, param_dtype=torch.float32)
+    torch_rms_norm = rpt_model_torch.RPTRMSNorm(rpt_config, dtype=torch.float32, param_dtype=torch.float32)
 
     arr = np.zeros(4096)
     arr[:3] = [1, 2, 3]
@@ -62,7 +62,7 @@ def test_attention():
     embedded_input = wte.init_with_output(jax.random.PRNGKey(42), input_id)
 
     flax_rpt_model = rpt_model.FlaxRPTAttention(rpt_config, dtype=jnp.float32, param_dtype=jnp.float32)
-    torch_rpt_model = rpt_model_torch.TorchRPTAttention(rpt_config, dtype=torch.float32)
+    torch_rpt_model = rpt_model_torch.RPTAttention(rpt_config, dtype=torch.float32)
 
     flax_result = flax_rpt_model.init_with_output(jax.random.PRNGKey(42), jnp.array([embedded_input[0]]), jnp.ones_like(input_id))
     torch_result = torch_rpt_model.forward(torch.Tensor(np.array([embedded_input[0]])), torch.ones_like(torch.Tensor(input_id)))
@@ -86,7 +86,7 @@ def test_cross_attention():
     embedded_input = wte.init_with_output(jax.random.PRNGKey(42), input_id)
 
     flax_rpt_model = rpt_model.FlaxRPTCrossAttention(rpt_config, dtype=jnp.float32, param_dtype=jnp.float32)
-    torch_rpt_model = rpt_model_torch.TorchRPTCrossAttention(rpt_config, dtype=torch.float32)
+    torch_rpt_model = rpt_model_torch.RPTCrossAttention(rpt_config, dtype=torch.float32)
 
     flax_result = flax_rpt_model.init_with_output(jax.random.PRNGKey(42), jnp.array([embedded_input[0]]),
                                                   jnp.array([embedded_input[0]]))
@@ -110,7 +110,7 @@ def test_mlp():
     embedded_input = wte.init_with_output(jax.random.PRNGKey(42), input_id)
 
     flax_rpt_model = rpt_model.FlaxRPTMLP(rpt_config, dtype=jnp.float32, param_dtype=jnp.float32)
-    torch_rpt_model = rpt_model_torch.TorchRPTMLP(rpt_config, dtype=torch.float32)
+    torch_rpt_model = rpt_model_torch.RPTMLP(rpt_config, dtype=torch.float32)
 
     flax_result = flax_rpt_model.init_with_output(jax.random.PRNGKey(42), jnp.array([embedded_input[0]]))
     torch_result = torch_rpt_model.forward(torch.Tensor(np.array([embedded_input[0]])))
@@ -141,7 +141,6 @@ def test_lowcoder():
 
     lowcoder = rpt_model.FlaxRPTLowcoder(rpt_config, dtype=jnp.float32)
 
-    """
     lowcoder_outputs = lowcoder.init_with_output(jax.random.PRNGKey(42),
         jnp.array([hidden_states[0]]),
         attention_mask,
@@ -154,9 +153,9 @@ def test_lowcoder():
     )
 
     print(lowcoder_outputs)
-    """
 
-    lowcoder_torch = rpt_model_torch.TorchRPTLowcoderLayer(rpt_config, dtype=torch.float32)
+
+    lowcoder_torch = rpt_model_torch.RPTLowcoderLayer(rpt_config, dtype=torch.float32)
     lowcoder_torch_output = lowcoder_torch.forward(
         torch.Tensor(np.array([hidden_states[0]])),
         torch.Tensor(np.array(attention_mask)),
@@ -169,4 +168,3 @@ def test_lowcoder():
     print(lowcoder_torch_output)
 
 
-test_lowcoder()
