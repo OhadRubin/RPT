@@ -32,6 +32,10 @@ import gin
 import tqdm
 import absl
 
+jax.config.update("jax_debug_nans", True)
+jax.config.update('jax_disable_jit', True)
+
+
 absl.flags.DEFINE_multi_string(
     'gin_file', None, 'List of paths to the config files.')
 absl.flags.DEFINE_multi_string(

@@ -182,7 +182,10 @@ def make_shard_and_gather_fns(partition_specs, dtype_specs=None):
             out_shardings=partition_spec
         )
         def shard_fn(tensor):
-            return jax_shard_function(tensor).block_until_ready()
+            return jax_shard_function(tensor)
+            # TODO: cancel after debug
+            #return jax_shard_function(tensor).block_until_ready()
+
         return shard_fn
 
     def make_gather_fn(partition_spec, dtype_spec=None):
