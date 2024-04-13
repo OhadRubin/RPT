@@ -416,7 +416,7 @@ class RPTRMSNorm(nn.Module):
         else:
             out = output * weight
 
-        jax.debug.print('RMSNorm out: out={out}', out=out)
+        jax.debug.print('RMSNorm out: out={out}', out=jnp.array(out.detach().numpy()))
         return out
 
 
@@ -744,8 +744,6 @@ class RPTAttention(nn.Module):
             if self.config.add_null_attn:
                 xv, xk, attention_bias = self.concat_null_kv(xv, xk, attention_bias)
 
-            jax.debug.print('xq_rot_null={xq}\nxk_rot_null={xk}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()))
-
             # xq = torch.Size([1, 1024, 32, 128])
             # xk = torch.Size([1, 1024, 32, 128])
             # xv = torch.Size([1, 1024, 32, 128])
@@ -756,6 +754,7 @@ class RPTAttention(nn.Module):
             if not deterministic and self.config.attn_pdrop > 0.0:
                 dropout_rng = jax.random.key(0)
 
+            jax.debug.print('attn_input_mask: {x}', x=jnp.array(attention_mask.detach().numpy()))
             jax.debug.print('attn_input: xq_rot_null={xq}\nxk_rot_null={xk}', xq=jnp.array(xq.detach().numpy()),xk=jnp.array(xk.detach().numpy()))
 
             attn_weights = dot_product_attention_weights(
@@ -1949,6 +1948,8 @@ class RPTModule(nn.Module):
         if upcoder_input is None:
             input_embeds = self.wte(input_ids)
 
+            jax.debug.print('input_embeds={input_embeds}', input_embeds=input_embeds)
+
             # TODO: Determinsitc
             hidden_states = self.dropout(input_embeds)
 
@@ -2170,6 +2171,8 @@ class RPTPreTrainedModel(PreTrainedModel):
             padded_arr = torch.cat((padding.unsqueeze(0), arr), dim=1)
             return padded_arr
 
+
+    """
     def sample(
         self,
         input_ids: torch.LongTensor,
@@ -2188,18 +2191,10 @@ class RPTPreTrainedModel(PreTrainedModel):
         streamer: Optional["BaseStreamer"] = None,
         **model_kwargs,
     ) -> Union[Union[GenerateNonBeamOutput, torch.LongTensor], torch.Tensor]:
+        def stopping_condition(input_ids, scores):
+            return input_ids.shape[-1] % 64 == 0
 
-        state = None
-
-        for i in range(2):
-            input_ids = input_ids if state is None else torch.Tensor([[state.sequences[0][-1]]])
-
-            jax.debug.print('input_ids.shape: {input_ids}', input_ids=input_ids.shape)
-            state = super().sample(input_ids, logits_processor, lambda input_ids, scores: input_ids.shape[-1] >= 3 , logits_warper, max_length, pad_token_id, eos_token_id, output_attentions, output_hidden_states, output_scores, output_logits, return_dict_in_generate, synced_gpus, streamer, **model_kwargs)
-            if state.sequences[0][-1] == 0:
-                break
-
-            model_kwargs = self._update_model_kwargs_for_generation(state, model_kwargs)
+        state = super().sample(input_ids, logits_processor, stopping_condition, logits_warper, max_length, pad_token_id, eos_token_id, output_attentions, output_hidden_states, output_scores, output_logits, return_dict_in_generate, synced_gpus, streamer, **model_kwargs)
 
         last_lowcoder_states = self.module.transformer.cached_array
 
@@ -2210,26 +2205,32 @@ class RPTPreTrainedModel(PreTrainedModel):
         state.sequences = self.pad_to_closest_multiple_of_k(state.sequences, 64)
         # TODO: Don't use 64
         return state, encoded_lowcoder_states
-
     """
-    def _sample(
-        self,
-        input_ids: None,
-        max_length: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[int] = None,
-        prng_key: Optional[jnp.ndarray] = None,
-        logits_processor: Optional[transformers.LogitsProcessorList] = None,
-        logits_warper: Optional[transformers.FlaxLogitsProcessorList] = None,
-        trace: bool = True,
-        params: Optional[Dict[str, jnp.ndarray]] = None,
-        model_kwargs: Optional[Dict[str, jnp.ndarray]] = None,
+
+
+
+    def sample(
+            self,
+            input_ids: torch.LongTensor,
+            logits_processor: Optional[LogitsProcessorList] = None,
+            stopping_criteria: Optional[StoppingCriteriaList] = None,
+            logits_warper: Optional[LogitsProcessorList] = None,
+            max_length: Optional[int] = None,
+            pad_token_id: Optional[int] = None,
+            eos_token_id: Optional[Union[int, List[int]]] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            output_scores: Optional[bool] = None,
+            output_logits: Optional[bool] = None,
+            return_dict_in_generate: Optional[bool] = None,
+            synced_gpus: bool = False,
+            streamer: Optional["BaseStreamer"] = None,
+            **model_kwargs,
     ):
         # init values
-        max_length = max_length if max_length is not None else self.generation_config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
-        prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
+        prng_key = jax.random.PRNGKey(0)
 
         batch_size, cur_len = input_ids.shape
 
@@ -2238,8 +2239,7 @@ class RPTPreTrainedModel(PreTrainedModel):
         cur_len = jnp.array(cur_len)
 
         # per batch-item holding current token in loop.
-        sequences = jnp.full((batch_size, max_length), pad_token_id, dtype=jnp.int32)
-        sequences = lax.dynamic_update_slice(sequences, input_ids, (0, 0))
+        sequences = input_ids
 
         # per batch-item state bit indicating if sentence has finished.
         is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
@@ -2262,37 +2262,39 @@ class RPTPreTrainedModel(PreTrainedModel):
         )
 
         def sample_search_cond_fn(state):
-            #state termination condition fn.
-            has_reached_max_length = state.cur_len == max_length
+            has_reached_max_length = state.cur_len % 64 == 0
             all_sequence_finished = jnp.all(state.is_sent_finished)
             finish_generation = jnp.logical_or(has_reached_max_length, all_sequence_finished)
             return ~finish_generation
 
         def sample_search_body_fn(state):
-            #state update fn.
             prng_key, prng_key_next = jax.random.split(state.prng_key)
-            model_outputs = model(state.running_token, params=params, **state.model_kwargs)
+            jax.debug.print('input_ids.shape: {input_ids}', input_ids=state.running_token)
+            model_outputs = model(state.running_token, **state.model_kwargs)
 
             logits = model_outputs.logits[:, -1]
 
             # apply min_length, ...
-            logits = logits_processor(state.sequences, logits, state.cur_len)
+            logits = logits_processor(state.sequences, logits)
             # apply top_p, top_k, temperature
-            logits = logits_warper(logits, logits, state.cur_len)
+            logits = logits_warper(logits, logits)
 
-            next_token = jax.random.categorical(prng_key, logits, axis=-1)
+            # 5295
+            # Array([4146024105,  967050713], dtype=uint32) -> 1383
+            # 8 -> 8.617962
+            next_token = jax.random.categorical(prng_key, logits.numpy(), axis=-1)
 
             next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
             next_token = next_token * ~next_is_sent_finished + pad_token_id * next_is_sent_finished
             next_token = next_token[:, None]
 
-            next_sequences = lax.dynamic_update_slice(state.sequences, next_token, (0, state.cur_len))
-            next_model_kwargs = self.update_inputs_for_generation(model_outputs, state.model_kwargs)
+            next_sequences = torch.concatenate([state.sequences, torch.Tensor(next_token.tolist())], dim=1)
+            next_model_kwargs = self._update_model_kwargs_for_generation(model_outputs, state.model_kwargs)
 
             return SampleState(
                 cur_len=state.cur_len + 1,
                 sequences=next_sequences,
-                running_token=next_token,
+                running_token=torch.Tensor(next_token.tolist()),
                 is_sent_finished=next_is_sent_finished,
                 model_kwargs=next_model_kwargs,
                 prng_key=prng_key_next,
@@ -2301,23 +2303,19 @@ class RPTPreTrainedModel(PreTrainedModel):
         # The very first prompt often has sequence length > 1, so run outside of `lax.while_loop` to comply with TPU
         if input_ids.shape[1] > 1:
             state = sample_search_body_fn(state)
-        # state = lax.cond(model_kwargs['attention_mask'].sum() > 1, lambda: sample_search_body_fn(state), lambda: state )
 
-        if not trace:
-            state = self._run_loop_in_debug(sample_search_cond_fn, sample_search_body_fn, state)
-        else:
-            state = lax.while_loop(sample_search_cond_fn, sample_search_body_fn, state)
+        while sample_search_cond_fn(state):
+            state = sample_search_body_fn(state)
 
-        past_key_values = state.model_kwargs['past_key_values']
-        last_lowcoder_states = past_key_values['transformer']['cached_array']
+        last_lowcoder_states = self.module.transformer.cached_array
 
         encoded_lowcoder_states = self.preret_forward(
-                           hidden_states=last_lowcoder_states,
-                           attention_mask = jnp.ones(last_lowcoder_states.shape[:-1]),
-                           params=params)
+            hidden_states=last_lowcoder_states,
+            attention_mask=torch.ones(last_lowcoder_states.shape[:-1]))
 
         return state, encoded_lowcoder_states
-    """
+
+
 
 class RPTModel(RPTPreTrainedModel):
     module_class = RPTModule
@@ -2460,6 +2458,8 @@ class RPTForCausalLMModule(nn.Module):
         if self.config.palm_init:
             lm_logits = lm_logits / hidden_states.shape[-1]**0.5
 
+        jax.debug.print('lm_logits={x}', x=jnp.array(lm_logits.detach().numpy()))
+
         return lm_logits
 
 
@@ -2484,7 +2484,6 @@ class RPTForCausalLM(RPTPreTrainedModel):
             input_ids = input_ids[:, -1:]
 
         return {
-            "input_ids": input_ids, # TODO: Use the correct parameter
             "past_key_values": past_key_values,
             "encoded_neighbors": encoded_neighbors,
             "attention_mask": attention_mask,
