@@ -461,6 +461,8 @@ def main(argv):
                 append=False,
             )
 
+            past_key_values = None
+
             output_text = [tuple() for _ in range(batch_size)]
 
             #params.pop("cache")
@@ -508,7 +510,10 @@ def main(argv):
                 )
                 output, new_past_key_values, enc_lowcoder_states = forward_generate(batch, max_new_tokens, temperature, past_key_values=past_key_values)
                 #params.update(cache=past_key_values)
-                past_key_values = {**past_key_values, **new_past_key_values}
+                if past_key_values is not None:
+                    past_key_values = {**past_key_values, **new_past_key_values}
+                else:
+                    past_key_values = new_past_key_values
                 output_text = postproc_output(tokenizer, output, output_text, verbose=True)
 
             return ["".join(x) for x in output_text]

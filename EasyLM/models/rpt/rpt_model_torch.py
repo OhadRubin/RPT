@@ -391,20 +391,20 @@ class RPTRMSNorm(nn.Module):
         return x * torch.rsqrt(torch.square(x).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        #jax.debug.print('RMSNorm input: x={x} type={type}', x=jnp.array(x.detach().numpy()), type=x.dtype)
+        ##jax.debug.print('RMSNorm input: x={x} type={type}', x=jnp.array(x.detach().numpy()), type=x.dtype)
         x = x.type(torch.promote_types(self.dtype, torch.float32))
-        #jax.debug.print('RMSNorm promoted: x={x} type={type}', x=jnp.array(x.detach().numpy()), type=x.dtype)
+        ##jax.debug.print('RMSNorm promoted: x={x} type={type}', x=jnp.array(x.detach().numpy()), type=x.dtype)
         output = self._norm(x).type(self.dtype)
-        #jax.debug.print('RMSNorm output: output={output}', output=jnp.array(output.detach().numpy()))
+        ##jax.debug.print('RMSNorm output: output={output}', output=jnp.array(output.detach().numpy()))
         weight = torch.asarray(self.weight, dtype=self.dtype)
-        #jax.debug.print('RMSNorm weight: weight={weight}', weight=jnp.array(weight.detach().numpy()))
-        #jax.debug.print('RMSNorm self.config.rms_one_baseline: x={x}', x=self.config.rms_one_baseline)
+        ##jax.debug.print('RMSNorm weight: weight={weight}', weight=jnp.array(weight.detach().numpy()))
+        ##jax.debug.print('RMSNorm self.config.rms_one_baseline: x={x}', x=self.config.rms_one_baseline)
         if self.config.rms_one_baseline:
             out = output * (1 - weight)
         else:
             out = output * weight
 
-        #jax.debug.print('RMSNorm out: out={out}', out=jnp.array(out.detach().numpy()))
+        ##jax.debug.print('RMSNorm out: out={out}', out=jnp.array(out.detach().numpy()))
         return out
 
 
@@ -564,7 +564,6 @@ class RPTAttention(nn.Module):
             rot_dim = self.config.rot_dim
         else:
             rot_dim = self.head_dim
-        # E: positional encoding
         self.freqs_cis = precompute_freqs_cis(
             rot_dim,
             config.max_sequence_length * 2,
@@ -584,11 +583,23 @@ class RPTAttention(nn.Module):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
 
     def _concatenate_to_cache(self, key, value, query, attention_mask, layer_past):
-        """
-        This function takes projected key, value states from a single input token and concatenates the states to cached
-        states from previous steps. This function is slighly adapted from the official Flax repository:
-        https://github.com/google/flax/blob/491ce18759622506588784b4fca0e4bf05f8c8cd/flax/linen/attention.py#L252
-        """
+        is_initialized = layer_past is not None
+
+        if not is_initialized:
+            key_max_shape = list(key.shape)
+            value_max_shape = list(value.shape)
+            query_max_shape = list(query.shape)
+            attention_mask_max_shape = list(attention_mask.shape)
+            key_max_shape[1] = value_max_shape[1] = query_max_shape[1] = attention_mask_max_shape[1] = self.config.window_length
+
+            jax_key = torch.zeros(key_max_shape, dtype=key.dtype)
+            jax_value = torch.zeros(value_max_shape, dtype=key.dtype)
+            jax_query = torch.zeros(query_max_shape, dtype=key.dtype)
+            jax_attention_mask = torch.zeros(attention_mask_max_shape, dtype=key.dtype)
+
+            past_xk, past_xv, past_attention_mask = self._concatenate_to_cache(jax_key, jax_value, jax_query, jax_attention_mask, [{}])
+            presets = ({'xk': past_xk, 'xv': past_xv, 'cache_mask': past_attention_mask},)
+            return self._concatenate_to_cache(key, value, query, attention_mask, presets)
 
         past_key = jnp.array(layer_past[0]['xk']).astype(jnp.float32) if layer_past is not None and 'xk' in layer_past[0] else jnp.array(torch.zeros(key.shape, dtype=key.dtype)).astype(jnp.float32)
         past_value = jnp.array(layer_past[0]['xv']).astype(jnp.float32) if layer_past is not None and 'xv' in layer_past[0] else jnp.array(torch.zeros(value.shape, dtype=key.dtype)).astype(jnp.float32)
@@ -599,8 +610,8 @@ class RPTAttention(nn.Module):
         value = jnp.array(value.detach().numpy())
         query = jnp.array(query.detach().numpy())
 
-        jax.debug.print("key_to_cache={x}",x=key)
-        jax.debug.print("value_to_cache={x}",x=value)
+        #jax.debug.print("key_to_cache={x}",x=key)
+        #jax.debug.print("value_to_cache={x}",x=value)
 
         # detect if we're initializing by absence of existing cache data.
         is_initialized = past_key is not None
@@ -627,8 +638,16 @@ class RPTAttention(nn.Module):
                                                  value,
                                                  indices)
                 mask_operand = jnp.roll(cache_mask, shift=-num_updated_cache_vectors, axis=-1)
+
+                #jax.debug.print('cache_mask={x}', x=cache_mask)
+                #jax.debug.print('mask_operand={x}', x=mask_operand)
+                #jax.debug.print('(0,) * len(batch_dims)+ (shift,)={x}', x=(0,) * len(batch_dims)+ (shift,))
+                #jax.debug.print('start: attention_mask={x}', x=attention_mask)
+
                 attention_mask = lax.dynamic_update_slice(mask_operand, attention_mask.astype(mask_operand.dtype),
                                                           (0,) * len(batch_dims) + (shift,))
+
+                #jax.debug.print('end: attention_mask={x}', x=attention_mask)
 
                 return key, value, attention_mask
 
@@ -678,17 +697,17 @@ class RPTAttention(nn.Module):
         batch_size = hidden_states.shape[0]
         query_attention_mask = attention_mask
 
-        jax.debug.print('A: attention_mask={x}',x=jnp.array(attention_mask))
+        #jax.debug.print('A: attention_mask={x}',x=jnp.array(attention_mask))
 
         presets = None
         if layer_past is not None or init_cache and not disable_cache:
             xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask, layer_past)
             presets = ({'xk': xk, 'xv': xv, 'cache_mask': attention_mask},)
 
-        jax.debug.print('B: attention_mask={x}',x=jnp.array(attention_mask))
+        #jax.debug.print('B: attention_mask={x}',x=jnp.array(attention_mask))
 
 
-        jax.debug.print('post_cache: xq={xq}\nxk={xk}\nxv={xv}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()), xv=jnp.array(xv.detach().numpy()))
+        ##jax.debug.print('post_cache: xq={xq}\nxk={xk}\nxv={xv}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()), xv=jnp.array(xv.detach().numpy()))
 
         key_length = xk.shape[-3]
 
@@ -702,11 +721,12 @@ class RPTAttention(nn.Module):
                 torch.clip(torch.cumsum(attention_mask, dim=-1) - 1, min=0),
                 (batch_size, key_length)
             ).type(torch.int)
-            jax.debug.print('position_ids_k={position_ids_k}', position_ids_k=position_ids_k)
+            #jax.debug.print('cumsum={x}', x=torch.cumsum(attention_mask, dim=-1))
+            #jax.debug.print('position_ids_k={position_ids_k}', position_ids_k=position_ids_k)
             freqs_cis_k = np.take(self.freqs_cis, position_ids_k, axis=0)
-            jax.debug.print('freqs_cis_k={freqs_cis_k}', freqs_cis_k=freqs_cis_k)
+            #jax.debug.print('freqs_cis_k={freqs_cis_k}', freqs_cis_k=freqs_cis_k)
             position_ids += position_ids_k.max() - position_ids.max()
-            jax.debug.print('position_ids={position_ids}', position_ids=position_ids)
+            #jax.debug.print('position_ids={position_ids}', position_ids=position_ids)
         else:
             position_ids_k = position_ids
             freqs_cis_k = None
@@ -718,16 +738,14 @@ class RPTAttention(nn.Module):
             attention_mask = rearrange(attention_mask, 'b (s l) -> (b s) l', s=n_windows)
 
         freqs_cis = np.take(self.freqs_cis, position_ids, axis=0)
-        jax.debug.print('freqs_cis={freqs_cis}', freqs_cis=freqs_cis)
+        #jax.debug.print('freqs_cis={freqs_cis}', freqs_cis=freqs_cis)
 
 
-        # TODO: Figure out caching
-        #if self.has_variable("cache", "cached_key"):
-        #    causal_mask = make_attention_mask(position_ids, position_ids_k, lambda x, y: x >= y,
-        #                                      extra_batch_dims=0, dtype=bool)
-        #else:
-        #    causal_mask = self.causal_mask[:, :, :query_length, :key_length]
-        causal_mask = self.causal_mask[:, :, :query_length, :key_length]
+        if layer_past is not None or presets is not None:
+            causal_mask = make_attention_mask(position_ids, position_ids_k, lambda x, y: x >= y,
+                                              extra_batch_dims=0, dtype=torch.bool)
+        else:
+            causal_mask = self.causal_mask[:, :, :query_length, :key_length]
 
         causal_mask = torch.broadcast_to(causal_mask, (batch_size,) + causal_mask.shape[1:])
         attention_mask = torch.broadcast_to(attention_mask.unsqueeze(0).unsqueeze(0), causal_mask.shape)
@@ -741,7 +759,7 @@ class RPTAttention(nn.Module):
                                   freqs_cis_k=freqs_cis_k,
                                   dtype=self.dtype, rot_dim=self.config.rot_dim)
 
-        jax.debug.print('xq_rot={xq}\nxk_rot={xk}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()))
+        #jax.debug.print('xq_rot={xq}\nxk_rot={xk}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()))
 
 
         # TODO: Get rid of numpy and lax
@@ -820,6 +838,7 @@ class RPTAttention(nn.Module):
 
             jax.debug.print('attn_input_mask: {x}', x=jnp.array(attention_mask.detach().numpy()))
             jax.debug.print('attn_input: xq_rot_null={xq}\nxk_rot_null={xk}', xq=jnp.array(xq.detach().numpy()),xk=jnp.array(xk.detach().numpy()))
+            jax.debug.print('bias={x}', x=jnp.array(attention_bias.detach().numpy()))
 
             attn_weights = dot_product_attention_weights(
                 jnp.array(xq.detach().numpy()),
@@ -843,7 +862,7 @@ class RPTAttention(nn.Module):
         attn_output = self._merge_heads(attn_output)
         attn_output = self.wo(attn_output)
 
-        jax.debug.print('attn_output={attn_output}', attn_output=jnp.array(attn_output.detach().numpy()))
+        ##jax.debug.print('attn_output={attn_output}', attn_output=jnp.array(attn_output.detach().numpy()))
 
         # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, presets)
@@ -953,14 +972,14 @@ class RPTCrossAttention(nn.Module):
 
         is_cross_attention = key_value_states is not None
 
-        #jax.debug.print('hidden_states={hidden_states}', hidden_states=jnp.array(hidden_states.detach().numpy()))
+        ##jax.debug.print('hidden_states={hidden_states}', hidden_states=jnp.array(hidden_states.detach().numpy()))
 
         if not is_cross_attention:
             xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
         else:
             xq, xk, xv = self.wq(hidden_states), self.wk(key_value_states), self.wv(key_value_states)
 
-        #jax.debug.print('cross attention: xq={xq}\nxk={xk}\nxv={xv}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()), xv=jnp.array(xv.detach().numpy()))
+        ##jax.debug.print('cross attention: xq={xq}\nxk={xk}\nxv={xv}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()), xv=jnp.array(xv.detach().numpy()))
 
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
@@ -1017,7 +1036,7 @@ class RPTCrossAttention(nn.Module):
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
 
-        #jax.debug.print('cross attention: dot_product_attention_weights: xq={xq}\nxk={xk}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()))
+        ##jax.debug.print('cross attention: dot_product_attention_weights: xq={xq}\nxk={xk}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()))
 
         attn_weights = dot_product_attention_weights(
             jnp.array(xq.detach().numpy()),
@@ -1031,20 +1050,20 @@ class RPTCrossAttention(nn.Module):
         )
         attn_weights = torch.Tensor(attn_weights.tolist())
 
-        #jax.debug.print('cross attention results: attn_weights={attn_weights}', attn_weights=jnp.array(attn_weights.detach().numpy()))
+        ##jax.debug.print('cross attention results: attn_weights={attn_weights}', attn_weights=jnp.array(attn_weights.detach().numpy()))
 
         attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv)
 
-        #jax.debug.print('cross attention attn_output: {x}', x=jnp.array(attn_output.detach().numpy()))
+        ##jax.debug.print('cross attention attn_output: {x}', x=jnp.array(attn_output.detach().numpy()))
 
         attn_output = self._merge_heads(attn_output)
 
-        #jax.debug.print('cross attention attn_output: {x}', x=jnp.array(attn_output.detach().numpy()))
+        ##jax.debug.print('cross attention attn_output: {x}', x=jnp.array(attn_output.detach().numpy()))
 
         attn_output = self.wo(attn_output)
 
-        #jax.debug.print("wo={wo}", wo=jnp.array(self.wo.weight.detach().numpy()))
-        #jax.debug.print('cross attention after wo attn_output: {x}', x=jnp.array(attn_output.detach().numpy()))
+        ##jax.debug.print("wo={wo}", wo=jnp.array(self.wo.weight.detach().numpy()))
+        ##jax.debug.print('cross attention after wo attn_output: {x}', x=jnp.array(attn_output.detach().numpy()))
 
         # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
@@ -1083,7 +1102,7 @@ class RPTMLP(nn.Module):
         self.dropout = nn.Dropout(p=self.config.resid_pdrop)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        #jax.debug.print('MLPInput: {x}', x=jnp.array(x.detach().numpy()))
+        jax.debug.print('MLPInput: {x}', x=jnp.array(x.detach().numpy()))
         if self.config.gated_ff:
             x1 = silu(self.w1(x))
             x3 = self.w3(x)
@@ -1352,7 +1371,7 @@ class RPTChunkedCrossAttention(nn.Module):
             position_ids = torch.arange(chunk_size) + chunk_size - 1
             position_ids = torch.broadcast_to(position_ids[None, :], (hidden_states.shape[0], chunk_size))
         else:
-            #jax.debug.print("hidden_states = hidden_states.reshape([1, 1, hidden_dim]): shape={shape}, hidden_dim={hidden_dim}", shape=hidden_states.shape, hidden_dim=hidden_dim)
+            ##jax.debug.print("hidden_states = hidden_states.reshape([1, 1, hidden_dim]): shape={shape}, hidden_dim={hidden_dim}", shape=hidden_states.shape, hidden_dim=hidden_dim)
             hidden_states = hidden_states.reshape([1, 1, hidden_dim])
             assert position_ids is not None
 
@@ -2098,11 +2117,11 @@ class RPTModule(nn.Module):
         retriever_input = None
 
         if upcoder_input is None:
-            #jax.debug.print('input_ids={input_ids}', input_ids=jnp.array(input_ids.detach().numpy()))
+            ##jax.debug.print('input_ids={input_ids}', input_ids=jnp.array(input_ids.detach().numpy()))
 
             input_embeds = self.wte(input_ids)
 
-            #jax.debug.print('input_embeds={input_embeds}', input_embeds=jnp.array(input_embeds.detach().numpy()))
+            ##jax.debug.print('input_embeds={input_embeds}', input_embeds=jnp.array(input_embeds.detach().numpy()))
 
             # TODO: Determinsitc
             hidden_states = self.dropout(input_embeds)
@@ -2122,7 +2141,7 @@ class RPTModule(nn.Module):
             hidden_states = lowcoder_outputs.last_hidden_state if return_dict else lowcoder_outputs[0]
             self._concatenate_to_lowcoder_cache(hidden_states)
 
-            #jax.debug.print('lowcoder output: x={x}', x=jnp.array(hidden_states.detach().numpy()))
+            ##jax.debug.print('lowcoder output: x={x}', x=jnp.array(hidden_states.detach().numpy()))
 
             retriever_input = hidden_states
             if self.retriever is not None:
@@ -2424,7 +2443,7 @@ class RPTPreTrainedModel(PreTrainedModel):
 
         def sample_search_body_fn(state):
             prng_key, prng_key_next = jax.random.split(state.prng_key)
-            #jax.debug.print('input_ids.shape: {input_ids}', input_ids=state.running_token)
+            ##jax.debug.print('input_ids.shape: {input_ids}', input_ids=state.running_token)
             #model_outputs = model(state.running_token, **state.model_kwargs)
             model_outputs = model(state.running_token, **state.model_kwargs)
 
@@ -2507,7 +2526,7 @@ class RPTForCausalLMModule(nn.Module):
             **kwargs
         )
 
-        #jax.debug.print('lowcoder_forward={outputs}', outputs=outputs)
+        ##jax.debug.print('lowcoder_forward={outputs}', outputs=outputs)
 
         return outputs, lowcoder_outputs.past_key_values
 
@@ -2605,14 +2624,14 @@ class RPTForCausalLMModule(nn.Module):
         )
 
     def unembed(self, hidden_states):
-        #jax.debug.print('unembed input={x}', x=jnp.array(hidden_states.detach().numpy()))
-        #jax.debug.print('unembed hidden states={x}', x=jnp.array(self.transformer.wte.weight.T.detach().numpy()))
+        jax.debug.print('unembed input={x}', x=jnp.array(hidden_states.detach().numpy()))
+        jax.debug.print('unembed hidden states={x}', x=jnp.array(self.transformer.wte.weight.T.detach().numpy()))
         if self.config.tie_word_embeddings:
             #shared_kernel = self.transformer.variables["params"]["wte"]["embedding"].T
             #lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
             # TODO: I think?
             lm_logits = torch.Tensor(hidden_states[0] @ self.transformer.wte.weight.T).unsqueeze(0)
-            #jax.debug.print('lm_logits={x}', x=jnp.array(lm_logits.detach().numpy()))
+            jax.debug.print('lm_logits={x}', x=jnp.array(lm_logits.detach().numpy()))
         else:
             lm_logits = self.lm_head(hidden_states)
 
@@ -2639,10 +2658,6 @@ class RPTForCausalLM(RPTPreTrainedModel):
         #batch_size, seq_length = input_ids.shape
         #if past_key_values is None:
         #    past_key_values = self.init_cache(batch_size, self.config.window_length)
-
-        input_ids = input_ids[:,-1024:]
-        if attention_mask.shape[-1] == 1:
-            input_ids = input_ids[:, -1:]
 
         return {
             "past_key_values": past_key_values,
