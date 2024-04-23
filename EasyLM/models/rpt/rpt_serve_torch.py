@@ -116,26 +116,28 @@ def apply_forward_loglikelihood(hf_model,
 def apply_forward_lowcoder(hf_model, input_tokens, input_mask, **kwargs):
     # TODO: Apply and other parameters
     # TODO: Output attention
-    # TODO: Second value
-    outputs = hf_model.module._lowcoder_forward(
+    outputs, past_key_values = hf_model.module._lowcoder_forward(
         input_ids=input_tokens,
         attention_mask=input_mask,
-        deterministic=True
+        deterministic=True,
+        **kwargs,
     )
-    #past_key_values = unfreeze(past_key_values).get("cache", None)
-    return outputs
+
+    return outputs, past_key_values
 
 
-def apply_forward_augment(hf_model, hidden_states, neighbor_hidden_states, neighbor_mask):
+def apply_forward_augment(hf_model, hidden_states, neighbor_hidden_states, neighbor_mask, past_key_values):
     # TODO: Second value
-    outputs = hf_model.module._augment_forward(
+    outputs, past_key_values = hf_model.module._augment_forward(
         hidden_states=hidden_states,
         neighbor_hidden_states=neighbor_hidden_states,
         neighbor_mask=neighbor_mask,
         deterministic=True,
+        layer_past=past_key_values['augment'],
+        init_cache=True, # TODO: Really??
     )
     #past_key_values = unfreeze(past_key_values).get("cache", None)
-    return outputs
+    return outputs, {'augment': past_key_values}
 
 
 def _loglikelihood_rolling(tokenizer, params, text, func, nearest_chunk_distance, num_neighbors=2, input_length=1024,
@@ -336,7 +338,10 @@ def main(argv):
     forward_loglikelihood = create_forward_loglikelihood(rpt_config, _forward_lowcoder, _forward_upcoder,
                                                          _forward_loglikelihood)
 
-    def _forward_generate(batch, max_new_tokens, temperature, sample=True):
+    def _forward_generate(batch, max_new_tokens, temperature, sample=True, past_key_values=None):
+        if past_key_values is None:
+            past_key_values = {'lowcoder': None, 'upcoder': None, 'augment': None}
+
         if sample:
             generate_kwargs = dict(
                 logits_processor=transformers.LogitsProcessorList(
@@ -369,12 +374,12 @@ def main(argv):
             torch.Tensor(batch['input_tokens']),
             attention_mask=torch.Tensor(batch['input_mask']).type(torch.int),
             encoded_neighbors=batch.get("encoded_neighbors", None),
-            past_key_values=params.get("cache", None),  # passing the initilized cache
+            past_key_values=past_key_values,  # passing the initilized cache
             max_new_tokens=1,
             **generate_kwargs
         )
         sequences = output.sequences[:, batch['input_tokens'].shape[1]:]
-        return sequences.type(torch.int), encoded_lowcoder_states
+        return sequences.type(torch.int), output.model_kwargs['past_key_values'], encoded_lowcoder_states
 
     if FLAGS.iterative_mode:
         prefix_forward_generate = _forward_generate
@@ -446,8 +451,8 @@ def main(argv):
             batch = prepare_prefix(prefix_tokenizer, text, FLAGS.input_length, FLAGS.add_bos_token)
             # TOOD: investigate this:
             # Flax RPT Retriver Encoded output
-            outputs = _forward_lowcoder(hf_model, **batch)
-            #params.update(cache=past_key_values) # TODO: Missing Param (also in the line above)
+            # TODO: init_cache bruh
+            outputs, past_key_values = _forward_lowcoder(hf_model, **batch)
             neighbor_hidden_states, neighbor_mask, *_ = memory.add(
                 input_tokens=batch["input_tokens"],
                 encoded_hidden_states=outputs.encoded_hidden_states,
@@ -477,11 +482,14 @@ def main(argv):
                         neighbor_mask = np.concatenate([prompt_mask, neighbor_mask], axis=1)
 
                     # TODO: Missing parameters
-                    neighbor_hidden_states = _forward_augment(
-                            hf_model, hidden_states=enc_lowcoder_states.original_hidden_states,
-                                         neighbor_hidden_states=torch.Tensor(neighbor_hidden_states),
-                                         neighbor_mask=torch.Tensor(neighbor_mask)
+                    neighbor_hidden_states, new_past_key_values = _forward_augment(
+                        hf_model,
+                        hidden_states=enc_lowcoder_states.original_hidden_states,
+                        neighbor_hidden_states=torch.Tensor(neighbor_hidden_states),
+                        neighbor_mask=torch.Tensor(neighbor_mask),
+                        past_key_values=past_key_values,
                     )
+                    past_key_values = {**past_key_values, **new_past_key_values}
                     #params.update(cache=past_key_values)
 
                     latest_token = output[:, -1:]
@@ -498,8 +506,9 @@ def main(argv):
                         chunk_index=chunk_index,
                     )
                 )
-                output, enc_lowcoder_states = forward_generate(batch, max_new_tokens, temperature)
+                output, new_past_key_values, enc_lowcoder_states = forward_generate(batch, max_new_tokens, temperature, past_key_values=past_key_values)
                 #params.update(cache=past_key_values)
+                past_key_values = {**past_key_values, **new_past_key_values}
                 output_text = postproc_output(tokenizer, output, output_text, verbose=True)
 
             return ["".join(x) for x in output_text]
