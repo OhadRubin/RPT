@@ -15,7 +15,7 @@ from ml_collections import ConfigDict
 from typing import Optional, Tuple, Union, Dict, List
 from transformers import AutoTokenizer, StoppingCriteriaList
 from einops import rearrange
-from transformers.generation.utils import GenerateNonBeamOutput
+from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPastAndCrossAttentions
 
 from torch_utils import make_attention_mask, make_causal_mask, combine_masks, gelu, silu
 from dataclasses import dataclass
@@ -31,18 +31,6 @@ from EasyLM.memory_efficient_attention import dot_product_attention_multihead as
 RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])
 EncodedNeighbors = namedtuple('EncodedNeighbors', ['neighbor_hidden_states', 'neighbor_mask',"chunk_index"])
 
-@dataclass
-class FlaxBaseModelOutput:
-    last_hidden_state: torch.Tensor = None
-    hidden_states: Optional[Tuple[torch.Tensor]] = None
-    attentions: Optional[Tuple[torch.Tensor]] = None
-
-@dataclass
-class FlaxBaseModelOutputCrossAttentions:
-    last_hidden_state: torch.Tensor = None
-    hidden_states: Optional[Tuple[torch.Tensor]] = None
-    attentions: Optional[Tuple[torch.Tensor]] = None
-    cross_attentions: Optional[Tuple[torch.Tensor]] = None
 
 
 @dataclass
@@ -595,13 +583,74 @@ class RPTAttention(nn.Module):
     def _merge_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
 
-    def _concatenate_to_cache(self, key, value, query, attention_mask):
-        raise NotImplementedError("Not implemented yet")
+    def _concatenate_to_cache(self, key, value, query, attention_mask, layer_past):
+        """
+        This function takes projected key, value states from a single input token and concatenates the states to cached
+        states from previous steps. This function is slighly adapted from the official Flax repository:
+        https://github.com/google/flax/blob/491ce18759622506588784b4fca0e4bf05f8c8cd/flax/linen/attention.py#L252
+        """
+
+        past_key = jnp.array(layer_past[0]['xk']).astype(jnp.float32) if layer_past is not None and 'xk' in layer_past[0] else jnp.array(torch.zeros(key.shape, dtype=key.dtype)).astype(jnp.float32)
+        past_value = jnp.array(layer_past[0]['xv']).astype(jnp.float32) if layer_past is not None and 'xv' in layer_past[0] else jnp.array(torch.zeros(value.shape, dtype=key.dtype)).astype(jnp.float32)
+        cache_mask = jnp.array(layer_past[0]['cache_mask']) if layer_past is not None and 'cache_mask' in layer_past[0] else jnp.array(torch.zeros(attention_mask.shape, dtype=key.dtype)).astype(jnp.float32)
+        attention_mask = jnp.array(attention_mask).astype(int)
+
+        key = jnp.array(key.detach().numpy())
+        value = jnp.array(value.detach().numpy())
+        query = jnp.array(query.detach().numpy())
+
+        jax.debug.print("key_to_cache={x}",x=key)
+        jax.debug.print("value_to_cache={x}",x=value)
+
+        # detect if we're initializing by absence of existing cache data.
+        is_initialized = past_key is not None
+        cached_key = past_key
+        cached_value = past_value
+
+        # TODO: Always is bruh
+        if is_initialized:
+            *batch_dims, max_length, num_heads, depth_per_head = cached_key.shape
+            # update key, value caches with our new 1d spatial slices
+            num_updated_cache_vectors = query.shape[-3]
+            shift = max_length - num_updated_cache_vectors
+
+            def cur_index_big(key, value, attention_mask):
+                indices = (0,) * len(batch_dims) + (shift, 0, 0)
+
+                key_operand = jnp.roll(cached_key, shift=-num_updated_cache_vectors, axis=-3)
+                key = lax.dynamic_update_slice(key_operand,
+                                               key,
+                                               indices)
+
+                value_operand = jnp.roll(cached_value, shift=-num_updated_cache_vectors, axis=-3)
+                value = lax.dynamic_update_slice(value_operand,
+                                                 value,
+                                                 indices)
+                mask_operand = jnp.roll(cache_mask, shift=-num_updated_cache_vectors, axis=-1)
+                attention_mask = lax.dynamic_update_slice(mask_operand, attention_mask.astype(mask_operand.dtype),
+                                                          (0,) * len(batch_dims) + (shift,))
+
+                return key, value, attention_mask
+
+            # cond_input = (key, value, attention_mask,)
+            # key, value, attention_mask = lax.cond(cur_index < max_length,
+            #                                     cur_index_small,
+            #                                     cur_index_big,
+            #                                     *cond_input)
+            # else:
+            key, value, attention_mask = cur_index_big(key, value, attention_mask)
+
+            cached_key.value = torch.Tensor(key.tolist())
+            cached_value.value = torch.Tensor(value.tolist())
+            cache_mask.value = attention_mask
+
+        return torch.Tensor(key.tolist()), torch.Tensor(value.tolist()), torch.Tensor(attention_mask.astype(jnp.int32).tolist())
 
     # TODO: Remember you removed to position_id parameter
     def forward(
             self,
             hidden_states,
+            layer_past,
             attention_mask,
             deterministic: bool = True,
             init_cache: bool = False,
@@ -628,9 +677,19 @@ class RPTAttention(nn.Module):
         query_length = xq.shape[-3]
         batch_size = hidden_states.shape[0]
         query_attention_mask = attention_mask
-        # TODO: Caching
-        #if (self.has_variable("cache", "cached_key") or init_cache) and not disable_cache:
-        #    xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask)
+
+        jax.debug.print('A: attention_mask={x}',x=jnp.array(attention_mask))
+
+        presets = None
+        if layer_past is not None or init_cache and not disable_cache:
+            xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask, layer_past)
+            presets = ({'xk': xk, 'xv': xv, 'cache_mask': attention_mask},)
+
+        jax.debug.print('B: attention_mask={x}',x=jnp.array(attention_mask))
+
+
+        jax.debug.print('post_cache: xq={xq}\nxk={xk}\nxv={xv}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()), xv=jnp.array(xv.detach().numpy()))
+
         key_length = xk.shape[-3]
 
         position_ids = torch.broadcast_to(
@@ -787,7 +846,11 @@ class RPTAttention(nn.Module):
         jax.debug.print('attn_output={attn_output}', attn_output=jnp.array(attn_output.detach().numpy()))
 
         # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
-        outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+        outputs = (attn_output, presets)
+
+        if output_attentions:
+            outputs += (attn_weights,)
+
         return outputs
 
     def concat_null_kv(self, xv, xk, attention_bias):
@@ -1059,6 +1122,7 @@ class RPTLowcoderLayer(nn.Module):
     def forward(
             self,
             hidden_states,
+            layer_past=None,
             attention_mask=None,
             position_ids=None,
             deterministic: bool = True,
@@ -1069,6 +1133,7 @@ class RPTLowcoderLayer(nn.Module):
         # run self attention on the hidden states
         attn_outputs = self.attention(
             self.attention_norm(hidden_states),
+            layer_past,
             attention_mask,
             deterministic,
             init_cache, # TODO: caching and stuff
@@ -1077,9 +1142,10 @@ class RPTLowcoderLayer(nn.Module):
             sliding_window=self.config.sliding_window,
         )
 
-        # TODO: check
         attn_output = attn_outputs[0]
         hidden_states = hidden_states + attn_output
+
+        outputs = attn_outputs[1:]
 
         # nomalize hidden states
         feed_forward_input = self.ffn_norm(hidden_states)
@@ -1114,8 +1180,12 @@ class RPTLowcoderLayer(nn.Module):
 
         hidden_states = hidden_states + feed_forward_hidden_states
 
-        # what's on attn_output[1:]??
-        return (hidden_states,) + attn_outputs[1:]
+        if init_cache:
+            outputs = (hidden_states,) + outputs
+        else:
+            outputs = (hidden_states,) + outputs[1:]
+
+        return outputs
 
 
 class RPTLowcoderLayerCollection(nn.ModuleList):
@@ -1140,6 +1210,7 @@ class RPTLowcoderLayerCollection(nn.ModuleList):
     def forward(
             self,
             hidden_states,
+            past_key_values=None,
             attention_mask=None,
             position_ids=None,
             deterministic: bool = True,
@@ -1153,12 +1224,18 @@ class RPTLowcoderLayerCollection(nn.ModuleList):
 
         fcm_mask = None
 
-        for block in self.blocks:
+        presents = () if init_cache else None
+
+        if past_key_values is None:
+            past_key_values = tuple([None] * len(self.blocks))
+
+        for i, (block, layer_past) in enumerate(zip(self.blocks, past_key_values)):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             layer_outputs = block(
                 hidden_states,
+                layer_past,
                 attention_mask,
                 position_ids,
                 deterministic,
@@ -1169,19 +1246,27 @@ class RPTLowcoderLayerCollection(nn.ModuleList):
             # TODO: Is this not useful?
             hidden_states = layer_outputs[0]
 
+            if init_cache:
+                presents = presents + (layer_outputs[1],)
+
             # TODO: Is this not useful?
             if output_attentions:
-                all_attentions += (layer_outputs[1],)
+                all_attentions += (layer_outputs[2 if init_cache else 1],)
+
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        outputs = (hidden_states, all_hidden_states, all_attentions)
+        past_key_values = {'lowcoder': presents}
+        outputs = (hidden_states, past_key_values, all_hidden_states, all_attentions)
 
         if not return_dict:
             return outputs
 
-        return FlaxBaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=all_hidden_states, attentions=all_attentions
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            past_key_values=past_key_values,
         )
 
 
@@ -1196,6 +1281,7 @@ class RPTLowcoder(nn.Module):
     def forward(
             self,
             hidden_states,
+            past_key_values=None,
             attention_mask=None,
             position_ids=None,
             deterministic: bool = True,
@@ -1206,6 +1292,7 @@ class RPTLowcoder(nn.Module):
     ):
         outputs = self.layers(
             hidden_states,
+            past_key_values,
             attention_mask,
             position_ids=position_ids,
             deterministic=deterministic,
@@ -1218,10 +1305,11 @@ class RPTLowcoder(nn.Module):
         if not return_dict:
             return outputs
 
-        return FlaxBaseModelOutput(
+        return BaseModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            past_key_values=outputs.past_key_values
         )
 
 
@@ -1332,6 +1420,7 @@ class RPTUpcoderLayer(nn.Module):
     def forward(
             self,
             hidden_states,
+            layer_past=None,
             attention_mask=None,
             position_ids=None,
             neighbor_hidden_states=None,
@@ -1346,6 +1435,7 @@ class RPTUpcoderLayer(nn.Module):
         print(f"In Upcoder Layer: Using CCA: {self.has_cca}")
         attn_outputs = self.attention(
             self.attention_norm(hidden_states),
+            layer_past,
             attention_mask,
             deterministic,
             init_cache,
@@ -1355,6 +1445,8 @@ class RPTUpcoderLayer(nn.Module):
         )
         attn_output = attn_outputs[0]
         hidden_states = hidden_states + attn_output
+
+        outputs = attn_outputs[1:]
 
         if self.cca is not None and neighbor_hidden_states is not None:
             if self.cca_norm2 is not None:
@@ -1404,7 +1496,12 @@ class RPTUpcoderLayer(nn.Module):
 
         hidden_states = hidden_states + feed_forward_hidden_states
 
-        return (hidden_states,) + attn_outputs[1:]
+        if init_cache:
+            outputs = (hidden_states,) + outputs
+        else:
+            outputs = (hidden_states,) + outputs[1:]
+
+        return outputs
 
 
 class RPTUpcoderLayerCollection(nn.Module):
@@ -1433,6 +1530,7 @@ class RPTUpcoderLayerCollection(nn.Module):
     def forward(
             self,
             hidden_states,
+            past_key_values=None,
             attention_mask=None,
             position_ids=None,
             neighbor_hidden_states=None,
@@ -1448,12 +1546,18 @@ class RPTUpcoderLayerCollection(nn.Module):
         all_cross_attentions = () if output_attentions else None
         all_hidden_states = () if output_hidden_states else None
 
-        for block in self.blocks:
+        presents = () if init_cache else None
+
+        if past_key_values is None:
+            past_key_values = tuple([None] * len(self.blocks))
+
+        for i, (block, layer_past) in enumerate(zip(self.blocks, past_key_values)):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
             layer_outputs = block(
                 hidden_states,  # 0
+                layer_past,
                 attention_mask,  # 1
                 position_ids,  # 2
                 neighbor_hidden_states,  # 3
@@ -1466,10 +1570,14 @@ class RPTUpcoderLayerCollection(nn.Module):
             )
             hidden_states = layer_outputs[0]
 
+            if init_cache:
+                presents = presents + (layer_outputs[1],)
+
             if output_attentions:
-                all_attentions += (layer_outputs[1],)
+                all_attentions += (layer_outputs[2 if init_cache else 1],)
                 if block.has_cca:
-                    all_cross_attentions += (layer_outputs[2],)
+                    all_cross_attentions += (layer_outputs[3 if init_cache else 2],)
+
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
@@ -1477,13 +1585,14 @@ class RPTUpcoderLayerCollection(nn.Module):
         outputs = (hidden_states, all_hidden_states, all_attentions)
 
         if not return_dict:
-            return outputs
+            return outputs + (presents,)
 
-        return FlaxBaseModelOutputCrossAttentions(
+        return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,
             attentions=all_attentions,
             cross_attentions=all_cross_attentions,
+            past_key_values=presents,
         )
 
 
@@ -1559,8 +1668,10 @@ class RPTCrossNeighborAugmentor(nn.Module):
 
     def forward(self,
                  neighbor_hidden_states: torch.Tensor,
+                 layer_past,
                  neighbor_mask: torch.Tensor,
                  output_attentions: torch.Tensor,
+                 init_cache,
                  deterministic: bool,
                  device_count: int):
         num_document_chunks, num_neighbors, ret_size, hidden_dim = neighbor_hidden_states.shape
@@ -1576,11 +1687,13 @@ class RPTCrossNeighborAugmentor(nn.Module):
 
         cross_neig_out = self.cross_neig_causal_att(
             hidden_states=self.xnei_norm1(pooled_neighbor_hidden_states),
+            layer_past=layer_past,
             attention_mask=pooled_neighbor_mask,
             output_attentions=output_attentions,
             deterministic=deterministic,
+            init_cache=init_cache,
             sliding_window=False,
-            # disable_cache=False,
+            disable_cache=False,
         )
 
         pooled_neighbor_hidden_states = cross_neig_out[0] + pooled_neighbor_hidden_states
@@ -1595,7 +1708,14 @@ class RPTCrossNeighborAugmentor(nn.Module):
         else:
             ret_gate_score = 0.1 + 0.9 * torch.sigmoid(ret_gate_score / hidden_dim)
             neighbor_hidden_states = ret_gate_score * neighbor_hidden_states
-        return (neighbor_hidden_states,) + cross_neig_out[1:]
+
+
+        if init_cache:
+            outputs = (neighbor_hidden_states, cross_neig_out[1]) + cross_neig_out[1:]
+        else:
+            outputs = (neighbor_hidden_states,) + cross_neig_out[1:]
+
+        return outputs
 
 
 class RPTUpcoder(nn.Module):
@@ -1622,6 +1742,8 @@ class RPTUpcoder(nn.Module):
                 neighbor_mask: torch.Tensor,
                 deterministic: bool = True,
                 output_attentions: bool = False,
+                init_cache=False,
+                layer_past=None,
                 ):
         if self.neighbor_augmentor is not None and neighbor_hidden_states is not None:
             nei_aug_outputs = self.neighbor_augmentor(
@@ -1632,20 +1754,28 @@ class RPTUpcoder(nn.Module):
                 output_attentions=output_attentions,
             )
             neighbor_hidden_states = nei_aug_outputs[0]
+            past_key_values = None
         if self.neighbor_cross_augmentor is not None and neighbor_hidden_states is not None:
             nei_xaug_outputs = self.neighbor_cross_augmentor(
                 neighbor_hidden_states=neighbor_hidden_states,
+                layer_past=layer_past,
                 neighbor_mask=neighbor_mask,
+                init_cache=init_cache,
                 deterministic=deterministic,
                 output_attentions=output_attentions,
                 device_count=hidden_states.shape[0],
             )
             neighbor_hidden_states = nei_xaug_outputs[0]
-        return neighbor_hidden_states
+            past_key_values = nei_xaug_outputs[1]
+
+        # TODO: Change var name
+        return neighbor_hidden_states, past_key_values
+
 
     def forward(
             self,
             hidden_states,
+            past_key_values=None,
             attention_mask=None,
             position_ids=None,
             neighbor_hidden_states=None,
@@ -1657,18 +1787,28 @@ class RPTUpcoder(nn.Module):
             output_hidden_states: bool = False,
             return_dict: bool = True,
     ):
+        augment_cache = past_key_values['augment'] if past_key_values is not None and 'augment' in past_key_values else None
+        upcoder_cache = past_key_values['upcoder'] if past_key_values is not None and 'upcoder' in past_key_values else None
+
+        agument_past_key_values = None
         if chunk_index is None:
-            neighbor_hidden_states = self.augment(
+            augmented_outputs = self.augment(
                 hidden_states,
                 neighbor_hidden_states,
                 neighbor_mask,
                 deterministic,
                 output_attentions,
+                init_cache=init_cache,
+                layer_past=augment_cache,
             )
+
+            neighbor_hidden_states = augmented_outputs[0]
+            agument_past_key_values = augmented_outputs[1]
         # else We are generating... And have already augmented the neighbor hidden states.
 
         outputs = self.layers(
             hidden_states,
+            upcoder_cache,
             attention_mask,
             position_ids=position_ids,
             neighbor_hidden_states=neighbor_hidden_states,
@@ -1681,13 +1821,20 @@ class RPTUpcoder(nn.Module):
             return_dict=return_dict,
         )
 
+        # TODO: Cringe
+        outputs.past_key_values = {
+            'upcoder': outputs.past_key_values,
+            'augment': agument_past_key_values,
+        }
+
         if not return_dict:
             return outputs
 
-        return FlaxBaseModelOutput(
+        return BaseModelOutputWithPast(
             last_hidden_state=outputs.last_hidden_state,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            past_key_values=outputs.past_key_values,
         )
 
 
@@ -1930,6 +2077,7 @@ class RPTModule(nn.Module):
     def forward(
             self,
             input_ids,
+            past_key_values,
             attention_mask,
             position_ids,
             deterministic=True,
@@ -1950,17 +2098,18 @@ class RPTModule(nn.Module):
         retriever_input = None
 
         if upcoder_input is None:
-            jax.debug.print('input_ids={input_ids}', input_ids=jnp.array(input_ids.detach().numpy()))
+            #jax.debug.print('input_ids={input_ids}', input_ids=jnp.array(input_ids.detach().numpy()))
 
             input_embeds = self.wte(input_ids)
 
-            jax.debug.print('input_embeds={input_embeds}', input_embeds=jnp.array(input_embeds.detach().numpy()))
+            #jax.debug.print('input_embeds={input_embeds}', input_embeds=jnp.array(input_embeds.detach().numpy()))
 
             # TODO: Determinsitc
             hidden_states = self.dropout(input_embeds)
 
             lowcoder_outputs = self.lowcoder(
                 hidden_states,
+                past_key_values['lowcoder'],
                 attention_mask,
                 position_ids=position_ids,
                 deterministic=deterministic,
@@ -1973,7 +2122,7 @@ class RPTModule(nn.Module):
             hidden_states = lowcoder_outputs.last_hidden_state if return_dict else lowcoder_outputs[0]
             self._concatenate_to_lowcoder_cache(hidden_states)
 
-            jax.debug.print('lowcoder output: x={x}', x=jnp.array(hidden_states.detach().numpy()))
+            #jax.debug.print('lowcoder output: x={x}', x=jnp.array(hidden_states.detach().numpy()))
 
             retriever_input = hidden_states
             if self.retriever is not None:
@@ -1997,6 +2146,7 @@ class RPTModule(nn.Module):
 
         upcoder_outputs = self.upcoder(
             hidden_states,
+            past_key_values,
             attention_mask,
             position_ids=position_ids,
             neighbor_hidden_states=torch.Tensor(neighbor_hidden_states),
@@ -2012,10 +2162,13 @@ class RPTModule(nn.Module):
         hidden_states = upcoder_outputs.last_hidden_state if return_dict else upcoder_outputs[0]
         hidden_states = self.ln_f(hidden_states)
 
+        past_key_values = {**lowcoder_outputs.past_key_values, **upcoder_outputs.past_key_values}
+
         if not return_dict:
-            return (hidden_states,) + upcoder_outputs + lowcoder_outputs
+            return (hidden_states,) + upcoder_outputs + lowcoder_outputs, past_key_values # TODO: Cringe
 
         return FlaxRPTModelOutput(
+            past_key_values=past_key_values,
             last_hidden_state=upcoder_outputs.last_hidden_state,
             upcoder_hidden_states=upcoder_outputs.hidden_states,
             upcoder_attentions=upcoder_outputs.attentions,
@@ -2070,21 +2223,17 @@ class RPTPreTrainedModel(PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.return_dict
 
         if attention_mask is not None:
-            # TODO: Int4
-            attention_mask = torch.Tensor(attention_mask).type(dtype=torch.int8)
-
-        inputs = {}
-        if past_key_values:
-            inputs["cache"] = past_key_values
+            attention_mask = torch.Tensor(attention_mask).type(dtype=torch.int)
 
         outputs = self.module(
             input_ids=torch.Tensor(input_ids).type(torch.int),
+            past_key_values=past_key_values,
             attention_mask=attention_mask,
             encoded_neighbors=encoded_neighbors,
             deterministic=True,
             retriever_supervision=None,
             train_step=None,
-            init_cache=False,
+            init_cache=True, # TODO: FALSE!!!
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
@@ -2346,7 +2495,9 @@ class RPTForCausalLMModule(nn.Module):
         """
         lowcoder_outputs = self.transformer.lowcoder(
             self.transformer.wte(torch.Tensor(input_ids.astype("i4")).type(torch.int)),
+            None,
             torch.Tensor(attention_mask),
+            init_cache=True,
             **kwargs
         )
 
@@ -2356,9 +2507,9 @@ class RPTForCausalLMModule(nn.Module):
             **kwargs
         )
 
-        jax.debug.print('lowcoder_forward={outputs}', outputs=outputs)
+        #jax.debug.print('lowcoder_forward={outputs}', outputs=outputs)
 
-        return outputs
+        return outputs, lowcoder_outputs.past_key_values
 
     def _augment_forward(self,
                          hidden_states,
@@ -2388,6 +2539,7 @@ class RPTForCausalLMModule(nn.Module):
     def forward(
             self,
             input_ids,
+            past_key_values=None,
             attention_mask=None,
             position_ids=None,
             deterministic: bool = True,
@@ -2415,6 +2567,7 @@ class RPTForCausalLMModule(nn.Module):
             position_ids=position_ids,
             upcoder_input=upcoder_input,
             encoded_neighbors=encoded_neighbors,
+            past_key_values=past_key_values,
         )
         if retriever_supervision is not None:
             transformer_input.update(retriever_supervision=retriever_supervision)
@@ -2437,7 +2590,7 @@ class RPTForCausalLMModule(nn.Module):
         lm_logits = self.unembed(hidden_states)
 
         if not return_dict:
-            return (lm_logits,) + outputs[1:]
+            return (lm_logits,) + outputs[1:] # TODO: Handle cache
         return FlaxRPTLMOutput(
             logits=lm_logits,
             upcoder_hidden_states=outputs.upcoder_hidden_states,
@@ -2448,10 +2601,11 @@ class RPTForCausalLMModule(nn.Module):
             lowcoder_attentions=outputs.lowcoder_attentions,
             retriever_output=outputs.retriever_output,
             retriever_input=outputs.retriever_input,
+            past_key_values=outputs.past_key_values,
         )
 
     def unembed(self, hidden_states):
-        jax.debug.print('unembed input={x}', x=jnp.array(hidden_states.detach().numpy()))
+        #jax.debug.print('unembed input={x}', x=jnp.array(hidden_states.detach().numpy()))
         #jax.debug.print('unembed hidden states={x}', x=jnp.array(self.transformer.wte.weight.T.detach().numpy()))
         if self.config.tie_word_embeddings:
             #shared_kernel = self.transformer.variables["params"]["wte"]["embedding"].T
