@@ -472,10 +472,10 @@ def main(argv):
                     chunk_index = None
                 else:
                     neighbor_hidden_states, neighbor_mask, *_ = memory.add(
-                        input_tokens=output, # torch.Size([1, 64])
-                        encoded_hidden_states=enc_lowcoder_states.encoded_hidden_states, # torch.Size([32, 64, 2048])
-                        key_chunks=enc_lowcoder_states.key_chunks, # torch.Size([32, 2048])
-                        query_chunks=enc_lowcoder_states.query_chunks, # torch.Size([32, 2048])
+                        input_tokens=output,
+                        encoded_hidden_states=enc_lowcoder_states.encoded_hidden_states,
+                        key_chunks=enc_lowcoder_states.key_chunks,
+                        query_chunks=enc_lowcoder_states.query_chunks,
                         append=False
                     )
                     if prompt is not None:
