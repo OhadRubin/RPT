@@ -1,6 +1,5 @@
 import torch
 
-
 def make_attention_mask(query_input: torch.Tensor,
                         key_input: torch.Tensor,
                         pairwise_fn=torch.multiply,
@@ -36,3 +35,19 @@ def gelu(x):
 
 def silu(x):
     return x * torch.sigmoid(x)
+
+# TODO: Fix cringe naming
+def assign_slice(operand, update, start_indexes):
+    slice_indicies = []
+
+    start_indexes = torch.clamp(
+        torch.Tensor(start_indexes),
+        torch.zeros(len(operand.shape)),
+        torch.tensor(operand.shape) - torch.tensor(update.shape)
+    ).type(torch.int)
+    end_indexes = (start_indexes + torch.tensor(update.shape)).type(torch.int)
+    for start_index, end_index in zip(start_indexes, end_indexes):
+        slice_indicies.append(slice(start_index, end_index))
+
+    operand[tuple(slice_indicies)] = update
+    return operand

@@ -127,7 +127,6 @@ def apply_forward_lowcoder(hf_model, input_tokens, input_mask, **kwargs):
 
 
 def apply_forward_augment(hf_model, hidden_states, neighbor_hidden_states, neighbor_mask, past_key_values):
-    # TODO: Second value
     outputs, past_key_values = hf_model.module._augment_forward(
         hidden_states=hidden_states,
         neighbor_hidden_states=neighbor_hidden_states,

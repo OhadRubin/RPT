@@ -7,7 +7,6 @@ import numpy as np
 import optax
 import torch
 import transformers
-from jax import lax
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 from mlxu import function_args_to_config, load_pickle, open_file
@@ -17,7 +16,7 @@ from transformers import AutoTokenizer, StoppingCriteriaList
 from einops import rearrange
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPastAndCrossAttentions
 
-from torch_utils import make_attention_mask, make_causal_mask, combine_masks, gelu, silu
+from torch_utils import make_attention_mask, make_causal_mask, combine_masks, gelu, silu, assign_slice
 from dataclasses import dataclass
 from transformers import LogitsProcessorList
 import jax
@@ -391,20 +390,14 @@ class RPTRMSNorm(nn.Module):
         return x * torch.rsqrt(torch.square(x).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        ##jax.debug.print('RMSNorm input: x={x} type={type}', x=jnp.array(x.detach().numpy()), type=x.dtype)
         x = x.type(torch.promote_types(self.dtype, torch.float32))
-        ##jax.debug.print('RMSNorm promoted: x={x} type={type}', x=jnp.array(x.detach().numpy()), type=x.dtype)
         output = self._norm(x).type(self.dtype)
-        ##jax.debug.print('RMSNorm output: output={output}', output=jnp.array(output.detach().numpy()))
         weight = torch.asarray(self.weight, dtype=self.dtype)
-        ##jax.debug.print('RMSNorm weight: weight={weight}', weight=jnp.array(weight.detach().numpy()))
-        ##jax.debug.print('RMSNorm self.config.rms_one_baseline: x={x}', x=self.config.rms_one_baseline)
         if self.config.rms_one_baseline:
             out = output * (1 - weight)
         else:
             out = output * weight
 
-        ##jax.debug.print('RMSNorm out: out={out}', out=jnp.array(out.detach().numpy()))
         return out
 
 
@@ -592,26 +585,18 @@ class RPTAttention(nn.Module):
             attention_mask_max_shape = list(attention_mask.shape)
             key_max_shape[1] = value_max_shape[1] = query_max_shape[1] = attention_mask_max_shape[1] = self.config.window_length
 
-            jax_key = torch.zeros(key_max_shape, dtype=key.dtype)
-            jax_value = torch.zeros(value_max_shape, dtype=key.dtype)
-            jax_query = torch.zeros(query_max_shape, dtype=key.dtype)
-            jax_attention_mask = torch.zeros(attention_mask_max_shape, dtype=key.dtype)
+            zero_key = torch.zeros(key_max_shape, dtype=key.dtype)
+            zero_value = torch.zeros(value_max_shape, dtype=key.dtype)
+            zero_query = torch.zeros(query_max_shape, dtype=key.dtype)
+            zero_attention_mask = torch.zeros(attention_mask_max_shape, dtype=key.dtype)
 
-            past_xk, past_xv, past_attention_mask = self._concatenate_to_cache(jax_key, jax_value, jax_query, jax_attention_mask, [{}])
+            past_xk, past_xv, past_attention_mask = self._concatenate_to_cache(zero_key, zero_value, zero_query, zero_attention_mask, [{}])
             presets = ({'xk': past_xk, 'xv': past_xv, 'cache_mask': past_attention_mask},)
             return self._concatenate_to_cache(key, value, query, attention_mask, presets)
 
-        past_key = jnp.array(layer_past[0]['xk']).astype(jnp.float32) if layer_past is not None and 'xk' in layer_past[0] else jnp.array(torch.zeros(key.shape, dtype=key.dtype)).astype(jnp.float32)
-        past_value = jnp.array(layer_past[0]['xv']).astype(jnp.float32) if layer_past is not None and 'xv' in layer_past[0] else jnp.array(torch.zeros(value.shape, dtype=key.dtype)).astype(jnp.float32)
-        cache_mask = jnp.array(layer_past[0]['cache_mask']) if layer_past is not None and 'cache_mask' in layer_past[0] else jnp.array(torch.zeros(attention_mask.shape, dtype=key.dtype)).astype(jnp.float32)
-        attention_mask = jnp.array(attention_mask).astype(int)
-
-        key = jnp.array(key.detach().numpy())
-        value = jnp.array(value.detach().numpy())
-        query = jnp.array(query.detach().numpy())
-
-        #jax.debug.print("key_to_cache={x}",x=key)
-        #jax.debug.print("value_to_cache={x}",x=value)
+        past_key = layer_past[0]['xk'] if layer_past is not None and 'xk' in layer_past[0] else torch.zeros(key.shape, dtype=key.dtype)
+        past_value = layer_past[0]['xv'] if layer_past is not None and 'xv' in layer_past[0] else torch.zeros(value.shape, dtype=key.dtype)
+        cache_mask = layer_past[0]['cache_mask'] if layer_past is not None and 'cache_mask' in layer_past[0] else torch.zeros(attention_mask.shape, dtype=key.dtype)
 
         # detect if we're initializing by absence of existing cache data.
         is_initialized = past_key is not None
@@ -625,29 +610,18 @@ class RPTAttention(nn.Module):
             num_updated_cache_vectors = query.shape[-3]
             shift = max_length - num_updated_cache_vectors
 
-            def cur_index_big(key, value, attention_mask):
+            def cur_index_big_torch(key, value, attention_mask):
                 indices = (0,) * len(batch_dims) + (shift, 0, 0)
 
-                key_operand = jnp.roll(cached_key, shift=-num_updated_cache_vectors, axis=-3)
-                key = lax.dynamic_update_slice(key_operand,
-                                               key,
-                                               indices)
+                key_operand = torch.roll(cached_key, shifts=-num_updated_cache_vectors, dims=-3)
+                key = assign_slice(key_operand, key, indices)
 
-                value_operand = jnp.roll(cached_value, shift=-num_updated_cache_vectors, axis=-3)
-                value = lax.dynamic_update_slice(value_operand,
-                                                 value,
-                                                 indices)
-                mask_operand = jnp.roll(cache_mask, shift=-num_updated_cache_vectors, axis=-1)
+                value_operand = torch.roll(cached_value, shifts=-num_updated_cache_vectors, dims=-3)
+                value = assign_slice(value_operand, value, indices)
 
-                #jax.debug.print('cache_mask={x}', x=cache_mask)
-                #jax.debug.print('mask_operand={x}', x=mask_operand)
-                #jax.debug.print('(0,) * len(batch_dims)+ (shift,)={x}', x=(0,) * len(batch_dims)+ (shift,))
-                #jax.debug.print('start: attention_mask={x}', x=attention_mask)
+                mask_operand = torch.roll(cache_mask, shifts=-num_updated_cache_vectors, dims=-1)
 
-                attention_mask = lax.dynamic_update_slice(mask_operand, attention_mask.astype(mask_operand.dtype),
-                                                          (0,) * len(batch_dims) + (shift,))
-
-                #jax.debug.print('end: attention_mask={x}', x=attention_mask)
+                attention_mask = assign_slice(mask_operand, attention_mask.type(mask_operand.dtype), (0,) * len(batch_dims) + (shift,))
 
                 return key, value, attention_mask
 
@@ -657,13 +631,13 @@ class RPTAttention(nn.Module):
             #                                     cur_index_big,
             #                                     *cond_input)
             # else:
-            key, value, attention_mask = cur_index_big(key, value, attention_mask)
+            key, value, attention_mask = cur_index_big_torch(key, value, attention_mask)
 
-            cached_key.value = torch.Tensor(key.tolist())
-            cached_value.value = torch.Tensor(value.tolist())
+            cached_key.value = key
+            cached_value.value = value
             cache_mask.value = attention_mask
 
-        return torch.Tensor(key.tolist()), torch.Tensor(value.tolist()), torch.Tensor(attention_mask.astype(jnp.int32).tolist())
+        return key, value, attention_mask
 
     # TODO: Remember you removed to position_id parameter
     def forward(
@@ -681,14 +655,8 @@ class RPTAttention(nn.Module):
         n_windows = self.config.n_windows
         # stride = self.config.stride if not disable_cache else None
 
-        jax.debug.print('hidden_states={hidden_states}', hidden_states=jnp.array(hidden_states.detach().numpy()))
-
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
-        jax.debug.print('xq={xq}\nxk={xk}\nxv={xv}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()), xv=jnp.array(xv.detach().numpy()))
-
-
-        # xq = torch.Size([1, 1024, 2048]) -> torch.Size([1, 1024, 16, 128])
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
         xv = self._split_heads(xv)
@@ -697,17 +665,10 @@ class RPTAttention(nn.Module):
         batch_size = hidden_states.shape[0]
         query_attention_mask = attention_mask
 
-        #jax.debug.print('A: attention_mask={x}',x=jnp.array(attention_mask))
-
         presets = None
         if layer_past is not None or init_cache and not disable_cache:
             xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask, layer_past)
             presets = ({'xk': xk, 'xv': xv, 'cache_mask': attention_mask},)
-
-        #jax.debug.print('B: attention_mask={x}',x=jnp.array(attention_mask))
-
-
-        ##jax.debug.print('post_cache: xq={xq}\nxk={xk}\nxv={xv}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()), xv=jnp.array(xv.detach().numpy()))
 
         key_length = xk.shape[-3]
 
@@ -721,12 +682,8 @@ class RPTAttention(nn.Module):
                 torch.clip(torch.cumsum(attention_mask, dim=-1) - 1, min=0),
                 (batch_size, key_length)
             ).type(torch.int)
-            #jax.debug.print('cumsum={x}', x=torch.cumsum(attention_mask, dim=-1))
-            #jax.debug.print('position_ids_k={position_ids_k}', position_ids_k=position_ids_k)
             freqs_cis_k = np.take(self.freqs_cis, position_ids_k, axis=0)
-            #jax.debug.print('freqs_cis_k={freqs_cis_k}', freqs_cis_k=freqs_cis_k)
             position_ids += position_ids_k.max() - position_ids.max()
-            #jax.debug.print('position_ids={position_ids}', position_ids=position_ids)
         else:
             position_ids_k = position_ids
             freqs_cis_k = None
@@ -738,7 +695,6 @@ class RPTAttention(nn.Module):
             attention_mask = rearrange(attention_mask, 'b (s l) -> (b s) l', s=n_windows)
 
         freqs_cis = np.take(self.freqs_cis, position_ids, axis=0)
-        #jax.debug.print('freqs_cis={freqs_cis}', freqs_cis=freqs_cis)
 
 
         if layer_past is not None or presets is not None:
@@ -759,22 +715,10 @@ class RPTAttention(nn.Module):
                                   freqs_cis_k=freqs_cis_k,
                                   dtype=self.dtype, rot_dim=self.config.rot_dim)
 
-        #jax.debug.print('xq_rot={xq}\nxk_rot={xk}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()))
 
-
-        # TODO: Get rid of numpy and lax
         # transform boolean mask into float mask
-        attention_bias = torch.Tensor(np.select(
-            attention_mask > 0,
-            torch.full(attention_mask.shape, 0.0).type(self.dtype),
-            torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype),
-        ))
-
-        attention_bias = torch.Tensor(lax.select(
-            jnp.array(attention_mask.detach().numpy()) > 0,
-            jnp.full(attention_mask.shape, 0.0).astype(jnp.float32),
-            jnp.full(attention_mask.shape, jnp.finfo(jnp.float32).min).astype(jnp.float32),
-        ).tolist())
+        attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype)
+        attention_bias[attention_mask > 0] = 0.0
 
         if self.num_key_value_groups > 1:
             xk = repeat_kv(xk, self.num_key_value_groups)
@@ -836,10 +780,6 @@ class RPTAttention(nn.Module):
             if not deterministic and self.config.attn_pdrop > 0.0:
                 dropout_rng = jax.random.key(0)
 
-            jax.debug.print('attn_input_mask: {x}', x=jnp.array(attention_mask.detach().numpy()))
-            jax.debug.print('attn_input: xq_rot_null={xq}\nxk_rot_null={xk}', xq=jnp.array(xq.detach().numpy()),xk=jnp.array(xk.detach().numpy()))
-            jax.debug.print('bias={x}', x=jnp.array(attention_bias.detach().numpy()))
-
             attn_weights = dot_product_attention_weights(
                 jnp.array(xq.detach().numpy()),
                 jnp.array(xk.detach().numpy()),
@@ -850,8 +790,6 @@ class RPTAttention(nn.Module):
                 dtype=jnp.float32,
             )
 
-            jax.debug.print('attn_weights={attn_weights}', attn_weights=attn_weights)
-
             attn_weights = torch.Tensor(attn_weights.tolist())
             print(f"{attn_weights.shape=}")
             attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv)
@@ -861,8 +799,6 @@ class RPTAttention(nn.Module):
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.wo(attn_output)
-
-        ##jax.debug.print('attn_output={attn_output}', attn_output=jnp.array(attn_output.detach().numpy()))
 
         # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, presets)
@@ -972,14 +908,10 @@ class RPTCrossAttention(nn.Module):
 
         is_cross_attention = key_value_states is not None
 
-        ##jax.debug.print('hidden_states={hidden_states}', hidden_states=jnp.array(hidden_states.detach().numpy()))
-
         if not is_cross_attention:
             xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
         else:
             xq, xk, xv = self.wq(hidden_states), self.wk(key_value_states), self.wv(key_value_states)
-
-        ##jax.debug.print('cross attention: xq={xq}\nxk={xk}\nxv={xv}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()), xv=jnp.array(xv.detach().numpy()))
 
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
@@ -1015,19 +947,10 @@ class RPTCrossAttention(nn.Module):
             null_mask = torch.ones((attention_mask.shape[0], 1), dtype=torch.float32)
             attention_mask = torch.concatenate((attention_mask, null_mask), dim=-1)
             attention_mask = attention_mask.unsqueeze(-2).unsqueeze(-2)
-            # TODO: Get rid of numpy
-            # attention_mask.shape = (16, 1, 1, 65)
-            attention_bias = np.select(
-                attention_mask > 0,
-                torch.full(attention_mask.shape, 0.0).type(self.dtype),
-                torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype),
-            )
 
-            attention_bias = lax.select(
-                jnp.array(attention_mask.detach().numpy()) > 0,
-                jnp.full(attention_mask.shape, 0.0).astype(jnp.float32),
-                jnp.full(attention_mask.shape, jnp.finfo(jnp.float32).min).astype(jnp.float32),
-            )
+            # attention_mask.shape = (16, 1, 1, 65)
+            attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype)
+            attention_bias[attention_mask > 0] = 0.0
         else:
             attention_bias = None
 
@@ -1036,12 +959,10 @@ class RPTCrossAttention(nn.Module):
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
 
-        ##jax.debug.print('cross attention: dot_product_attention_weights: xq={xq}\nxk={xk}', xq=jnp.array(xq.detach().numpy()), xk=jnp.array(xk.detach().numpy()))
-
         attn_weights = dot_product_attention_weights(
             jnp.array(xq.detach().numpy()),
             jnp.array(xk.detach().numpy()),
-            bias=attention_bias,
+            bias=None if attention_bias is None else jnp.array(attention_bias.detach().numpy()),
             dropout_rng=dropout_rng,
             dropout_rate=self.config.attn_pdrop,
             deterministic=deterministic,
@@ -1050,20 +971,11 @@ class RPTCrossAttention(nn.Module):
         )
         attn_weights = torch.Tensor(attn_weights.tolist())
 
-        ##jax.debug.print('cross attention results: attn_weights={attn_weights}', attn_weights=jnp.array(attn_weights.detach().numpy()))
-
         attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv)
-
-        ##jax.debug.print('cross attention attn_output: {x}', x=jnp.array(attn_output.detach().numpy()))
 
         attn_output = self._merge_heads(attn_output)
 
-        ##jax.debug.print('cross attention attn_output: {x}', x=jnp.array(attn_output.detach().numpy()))
-
         attn_output = self.wo(attn_output)
-
-        ##jax.debug.print("wo={wo}", wo=jnp.array(self.wo.weight.detach().numpy()))
-        ##jax.debug.print('cross attention after wo attn_output: {x}', x=jnp.array(attn_output.detach().numpy()))
 
         # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
@@ -1102,7 +1014,6 @@ class RPTMLP(nn.Module):
         self.dropout = nn.Dropout(p=self.config.resid_pdrop)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        jax.debug.print('MLPInput: {x}', x=jnp.array(x.detach().numpy()))
         if self.config.gated_ff:
             x1 = silu(self.w1(x))
             x3 = self.w3(x)
@@ -1371,7 +1282,6 @@ class RPTChunkedCrossAttention(nn.Module):
             position_ids = torch.arange(chunk_size) + chunk_size - 1
             position_ids = torch.broadcast_to(position_ids[None, :], (hidden_states.shape[0], chunk_size))
         else:
-            ##jax.debug.print("hidden_states = hidden_states.reshape([1, 1, hidden_dim]): shape={shape}, hidden_dim={hidden_dim}", shape=hidden_states.shape, hidden_dim=hidden_dim)
             hidden_states = hidden_states.reshape([1, 1, hidden_dim])
             assert position_ids is not None
 
@@ -1882,95 +1792,8 @@ class RPTRetriever(nn.Module):
             dtype=self.dtype,
             bias=True,
         )
-        self.fill_value = self.config.retriever_fill_value
-        self.n_skip_chunks = (self.config.max_sequence_length // self.config.n_windows) // self.config.chunk_size
         self.num_neighbors = self.config.num_neighbors
-        self.threshold_nei_scores = self.config.threshold_nei_scores
-        self.num_sequence_chunks = self.config.num_sequence_chunks
-        if self.config.aux_loss_schedule_steps is not None:
-            assert self.config.aux_scale is not None
-            self.aux_scale = self.config.aux_scale
-            self.aux_loss_schedule_fn = optax.linear_schedule(0, 1, self.config.aux_loss_schedule_steps)
 
-        if self.config.max_margin is not None and self.config.margin_schedule_steps is not None:
-            assert self.config.max_margin >= 1
-            self.increase_margin_schedule_fn = optax.linear_schedule(1, self.config.max_margin,
-                                                                     self.config.margin_schedule_steps)
-
-        if self.config.ss_schedule_steps is not None and \
-                self.config.scheduled_sampling_max_prob is not None \
-                and self.config.scheduled_sampling_min_prob is not None:
-            self.scheduled_sampling_schedule_fn = m1_cosine_decay_schedule(decay_steps=self.config.ss_schedule_steps,
-                                                                           min_value=self.config.scheduled_sampling_min_prob,
-                                                                           max_value=self.config.scheduled_sampling_max_prob)
-
-    def forward(
-            self,
-            hidden_states: torch.Tensor,
-            attention_mask: torch.Tensor = None,
-            retriever_supervision: RetrieverSupervision = None,
-            train_step: Optional[int] = None,
-            deterministic: bool = True,
-            output_attentions: bool = False,
-    ):
-
-        encoded_output = self.preret_encode(
-            hidden_states,
-            attention_mask,
-            deterministic,
-            output_attentions)
-
-        query_based_scores = torch.einsum('qd,kd->qk', encoded_output.query_chunks,
-                                        encoded_output.key_chunks)
-        query_based_scores /= torch.sqrt(self.config.hidden_size)
-
-        segment_mask = create_segment_mask(query_based_scores.shape[0], self.n_skip_chunks)
-
-        chunk_mask = encoded_output.chunk_mask
-        chunk_mask &= segment_mask
-        # TODO: Might not be relevant in inference
-        if retriever_supervision is not None:
-            aux_loss, target_neighbor_mask, target_score_based_idx, ret_metrics = self.compute_retriever_loss(
-                query_based_scores,
-                retriever_supervision,
-                chunk_mask,
-                train_step)
-        else:
-            aux_loss = None
-            target_neighbor_mask = None
-            target_score_based_idx = None
-            ret_metrics = None
-
-        query_score_based_idx = topk_chunks(query_based_scores, num_candidates=self.num_neighbors, where=chunk_mask)
-
-        top_nei_idx, nei_mask = self.apply_scheduled_sampling(
-            query_score_based_idx,
-            torch.take_along_axis(chunk_mask, query_score_based_idx, axis=-1),
-            target_score_based_idx,
-            target_neighbor_mask,
-            train_step,
-            deterministic)
-        neighbor_hidden_states = self.lookup_neighbor_states(encoded_output.encoded_hidden_states, top_nei_idx)
-        # TODO: fishy unsqueeze
-        nei_mask = torch.broadcast_to(nei_mask.unsqueeze(0), neighbor_hidden_states.shape[:-1])
-        return FlaxRPTRetrieverNeighborOutput(aux_loss=aux_loss if aux_loss is not None else None,
-                                              loss_scale=self.get_loss_scale(
-                                                  train_step) if aux_loss is not None else None,
-                                              neighbor_hidden_states=neighbor_hidden_states,
-                                              neighbor_mask=nei_mask,
-                                              retrieval_metrics=jax.tree_map(lambda x: x.mean(),
-                                                                             ret_metrics) if ret_metrics is not None else None,
-                                              )
-
-    # @classmethod
-    def lookup_neighbor_states(cls, cand_hidden_states: torch.Tensor, top_nei_idx: torch.Tensor):
-        num_document_chunks = top_nei_idx.shape[0]
-        shifted_hidden_states = torch.pad(cand_hidden_states[1:, ...], ((0, 1), (0, 0), (0, 0)))
-        curr_neighbor_hidden_states = cand_hidden_states[top_nei_idx.reshape(-1)]
-        next_neighbor_hidden_states = shifted_hidden_states[top_nei_idx.reshape(-1)]
-        neighbor_hidden_states = torch.concatenate((curr_neighbor_hidden_states, next_neighbor_hidden_states), dim=-2)
-        neighbor_hidden_states = einops.rearrange(neighbor_hidden_states, '(b k) r d -> b k r d', b=num_document_chunks)
-        return neighbor_hidden_states
 
     def preret_encode(self,
                       hidden_states: torch.Tensor,
@@ -2011,31 +1834,6 @@ class RPTRetriever(nn.Module):
             query_chunks=query_chunks,
             chunk_mask=chunk_mask,
             preret_attention=preret_bi_output[1:])
-
-    def apply_scheduled_sampling(self,
-                                 query_score_based_idx: torch.Tensor,
-                                 chunk_mask: torch.Tensor,
-                                 target_score_based_idx: torch.Tensor,
-                                 target_neighbor_mask: torch.Tensor,
-                                 train_step,
-                                 deterministic):
-        if deterministic or self.is_initializing() or target_score_based_idx is None:
-            top_nei_idx, top_nei_mask = query_score_based_idx, chunk_mask
-        else:
-
-            # TODO: figure it out, might not be relevant due to inference only code
-            rv = torch.bernoulli(p=self.scheduled_sampling_schedule_fn(train_step if not self.is_initializing() else 1),
-                                      shape=())  # this is a boolean of shape [1]
-            top_nei_idx, top_nei_mask = jax.lax.cond(rv,
-                                                     (), lambda args: (query_score_based_idx, chunk_mask),
-                                                     (), lambda args: (target_score_based_idx, target_neighbor_mask)
-                                                     )
-        return top_nei_idx, top_nei_mask
-
-    def get_loss_scale(self, train_step):
-        loss_scale = self.aux_loss_schedule_fn(train_step if not self.is_initializing() else 1)
-        return loss_scale * self.aux_scale
-# loss is calculated as lm_loss + (raw_aux_loss/valid_pairs.sum())* self.get_loss_scale(train_step)
 
 
 
@@ -2117,11 +1915,8 @@ class RPTModule(nn.Module):
         retriever_input = None
 
         if upcoder_input is None:
-            ##jax.debug.print('input_ids={input_ids}', input_ids=jnp.array(input_ids.detach().numpy()))
 
             input_embeds = self.wte(input_ids)
-
-            ##jax.debug.print('input_embeds={input_embeds}', input_embeds=jnp.array(input_embeds.detach().numpy()))
 
             # TODO: Determinsitc
             hidden_states = self.dropout(input_embeds)
@@ -2140,8 +1935,6 @@ class RPTModule(nn.Module):
 
             hidden_states = lowcoder_outputs.last_hidden_state if return_dict else lowcoder_outputs[0]
             self._concatenate_to_lowcoder_cache(hidden_states)
-
-            ##jax.debug.print('lowcoder output: x={x}', x=jnp.array(hidden_states.detach().numpy()))
 
             retriever_input = hidden_states
             if self.retriever is not None:
@@ -2346,43 +2139,6 @@ class RPTPreTrainedModel(PreTrainedModel):
             return padded_arr
 
 
-    """
-    def sample(
-        self,
-        input_ids: torch.LongTensor,
-        logits_processor: Optional[LogitsProcessorList] = None,
-        stopping_criteria: Optional[StoppingCriteriaList] = None,
-        logits_warper: Optional[LogitsProcessorList] = None,
-        max_length: Optional[int] = None,
-        pad_token_id: Optional[int] = None,
-        eos_token_id: Optional[Union[int, List[int]]] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_scores: Optional[bool] = None,
-        output_logits: Optional[bool] = None,
-        return_dict_in_generate: Optional[bool] = None,
-        synced_gpus: bool = False,
-        streamer: Optional["BaseStreamer"] = None,
-        **model_kwargs,
-    ) -> Union[Union[GenerateNonBeamOutput, torch.LongTensor], torch.Tensor]:
-        def stopping_condition(input_ids, scores):
-            return input_ids.shape[-1] % 64 == 0
-
-        state = super().sample(input_ids, logits_processor, stopping_condition, logits_warper, max_length, pad_token_id, eos_token_id, output_attentions, output_hidden_states, output_scores, output_logits, return_dict_in_generate, synced_gpus, streamer, **model_kwargs)
-
-        last_lowcoder_states = self.module.transformer.cached_array
-
-        encoded_lowcoder_states = self.preret_forward(
-            hidden_states=last_lowcoder_states,
-            attention_mask=torch.ones(last_lowcoder_states.shape[:-1]))
-
-        state.sequences = self.pad_to_closest_multiple_of_k(state.sequences, 64)
-        # TODO: Don't use 64
-        return state, encoded_lowcoder_states
-    """
-
-
-
     def sample(
             self,
             input_ids: torch.LongTensor,
@@ -2443,8 +2199,6 @@ class RPTPreTrainedModel(PreTrainedModel):
 
         def sample_search_body_fn(state):
             prng_key, prng_key_next = jax.random.split(state.prng_key)
-            ##jax.debug.print('input_ids.shape: {input_ids}', input_ids=state.running_token)
-            #model_outputs = model(state.running_token, **state.model_kwargs)
             model_outputs = model(state.running_token, **state.model_kwargs)
 
             logits = model_outputs.logits[:, -1]
@@ -2525,8 +2279,6 @@ class RPTForCausalLMModule(nn.Module):
             attention_mask=torch.Tensor(attention_mask),
             **kwargs
         )
-
-        ##jax.debug.print('lowcoder_forward={outputs}', outputs=outputs)
 
         return outputs, lowcoder_outputs.past_key_values
 
@@ -2624,21 +2376,14 @@ class RPTForCausalLMModule(nn.Module):
         )
 
     def unembed(self, hidden_states):
-        jax.debug.print('unembed input={x}', x=jnp.array(hidden_states.detach().numpy()))
-        jax.debug.print('unembed hidden states={x}', x=jnp.array(self.transformer.wte.weight.T.detach().numpy()))
         if self.config.tie_word_embeddings:
-            #shared_kernel = self.transformer.variables["params"]["wte"]["embedding"].T
-            #lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
-            # TODO: I think?
             lm_logits = torch.Tensor(hidden_states[0] @ self.transformer.wte.weight.T).unsqueeze(0)
-            jax.debug.print('lm_logits={x}', x=jnp.array(lm_logits.detach().numpy()))
         else:
             lm_logits = self.lm_head(hidden_states)
 
         if self.config.palm_init:
             lm_logits = lm_logits / hidden_states.shape[-1]**0.5
 
-        jax.debug.print('lm_logits={x}', x=jnp.array(lm_logits.detach().numpy()))
 
         return lm_logits
 
