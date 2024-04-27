@@ -56,7 +56,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
 import numpy as np
 
 
-def prepare_prefix(prefix_tokenizer, text, input_length, add_bos_token):
+def prepare_prefix(prefix_tokenizer, text, input_length, add_bos_token, device):
     inputs = prefix_tokenizer(
         text,
         padding='max_length',
@@ -70,8 +70,8 @@ def prepare_prefix(prefix_tokenizer, text, input_length, add_bos_token):
         input_tokens[:, 0] = prefix_tokenizer.bos_token_id
         input_mask[:, 0] = 1
     batch = dict(
-        input_tokens=input_tokens.astype(int),
-        input_mask=input_mask.astype(int),
+        input_tokens=torch.Tensor(input_tokens).type(torch.int).to(device),
+        input_mask=torch.Tensor(input_mask).type(torch.int).to(device),
     )
     return batch
 
@@ -312,7 +312,7 @@ def main(argv):
 
     hf_model = RPTForCausalLM(rpt_config)
 
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = "cpu"
     hf_model.to(device)
 
     # TODO: Cringe
@@ -442,7 +442,7 @@ def main(argv):
                 memory = Memory(chunk_size=64, num_neighbors=FLAGS.num_neighbors, nearest_chunk_distance=0,
                                 is_dense=FLAGS.dense_mem)
 
-            batch = prepare_prefix(prefix_tokenizer, text, FLAGS.input_length, FLAGS.add_bos_token)
+            batch = prepare_prefix(prefix_tokenizer, text, FLAGS.input_length, FLAGS.add_bos_token, device)
             # TOOD: investigate this:
             # Flax RPT Retriver Encoded output
             # TODO: init_cache bruh

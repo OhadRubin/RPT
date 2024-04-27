@@ -5,7 +5,6 @@ from distutils import dist
 
 import einops
 import gin
-import numpy as np # TODO: Remove
 import torch
 import transformers
 from torch import nn
@@ -1259,8 +1258,8 @@ class RPTChunkedCrossAttention(nn.Module):
             num_devices_chunks = num_document_chunks // local_device_count
             # ->  (-1 ,chunk_size, hidden_dim)
             hidden_states = hidden_states.reshape([-1, num_devices_chunks * chunk_size, hidden_dim])
-            # TODO: remove numpy
-            hidden_states = torch.Tensor(np.pad(hidden_states[:,causal_padding:,:], ((0,0),(0, causal_padding),(0,0)), 'constant'))
+
+            hidden_states = torch.nn.functional.pad(hidden_states[:, causal_padding:, :], (0, 0, 0, causal_padding, 0, 0), 'constant', 0)
             hidden_states = hidden_states.reshape([-1, chunk_size, hidden_dim])
 
             position_ids = torch.arange(chunk_size) + chunk_size - 1
@@ -1290,8 +1289,8 @@ class RPTChunkedCrossAttention(nn.Module):
             cross_attention_out = cross_attention_out.reshape([-1, num_devices_chunks * chunk_size, hidden_dim])
             # # pad back to original, with 0s at the beginning (which will be added to the residual and be fine)
             # TODO: numpy
-            cross_attention_out = torch.Tensor(np.pad(cross_attention_out, ((0, 0), (causal_padding, 0), (0, 0)), 'constant')[:,
-                                  :-causal_padding])
+            cross_attention_out = torch.nn.functional.pad(cross_attention_out, (0, 0, causal_padding, 0, 0, 0), 'constant', 0)[:,:-causal_padding]
+
         cross_attention_out = cross_attention_out.reshape([num_devices, seq_len, hidden_dim])
         return (cross_attention_out,) + output[1:]
 
@@ -2335,7 +2334,7 @@ class RPTForCausalLMModule(nn.Module):
 
         """
         lowcoder_outputs = self.transformer.lowcoder(
-            self.transformer.wte(torch.Tensor(input_ids.astype("i4")).type(torch.int)),
+            self.transformer.wte(input_ids),
             None,
             torch.Tensor(attention_mask),
             init_cache=True,
