@@ -362,13 +362,13 @@ class RPTRMSNorm(nn.Module):
         return out
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: torch.dtype = torch.float32, device=None) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].type(dtype) / dim))
     t = torch.arange(end)  # type: ignore
     freqs = torch.outer(t, freqs).type(dtype)  # type: ignore
     sin, cos = torch.sin(freqs), torch.cos(freqs)
     freqs_cis = cos + 1j * sin
-    return torch.asarray(freqs_cis)
+    return torch.asarray(freqs_cis).to(device)
 
 
 def apply_rotary_emb_(
@@ -472,7 +472,7 @@ class RPTAttention(nn.Module):
     The transformer's masked self attention layer
     """
 
-    def __init__(self, config: RPTConfig, dtype: torch.float32):
+    def __init__(self, config: RPTConfig, dtype: torch.float32, device=None):
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -481,6 +481,7 @@ class RPTAttention(nn.Module):
         self.head_dim = self.embed_dim // self.num_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.device = device
 
         # TODO: DEVICE!!!
         self.wq = nn.Linear(
@@ -522,6 +523,7 @@ class RPTAttention(nn.Module):
             rot_dim,
             config.max_sequence_length * 2,
             dtype=self.dtype,
+            device=device,
         )
         if self.config.add_null_attn:
             #self.null_k = self.param(f'null_k', nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
@@ -546,18 +548,18 @@ class RPTAttention(nn.Module):
             attention_mask_max_shape = list(attention_mask.shape)
             key_max_shape[1] = value_max_shape[1] = query_max_shape[1] = attention_mask_max_shape[1] = self.config.window_length
 
-            zero_key = torch.zeros(key_max_shape, dtype=key.dtype)
-            zero_value = torch.zeros(value_max_shape, dtype=key.dtype)
-            zero_query = torch.zeros(query_max_shape, dtype=key.dtype)
-            zero_attention_mask = torch.zeros(attention_mask_max_shape, dtype=key.dtype)
+            zero_key = torch.zeros(key_max_shape, dtype=key.dtype, device=self.device)
+            zero_value = torch.zeros(value_max_shape, dtype=key.dtype, device=self.device)
+            zero_query = torch.zeros(query_max_shape, dtype=key.dtype, device=self.device)
+            zero_attention_mask = torch.zeros(attention_mask_max_shape, dtype=key.dtype, device=self.device)
 
             past_xk, past_xv, past_attention_mask = self._concatenate_to_cache(zero_key, zero_value, zero_query, zero_attention_mask, [{}])
             presets = ({'xk': past_xk, 'xv': past_xv, 'cache_mask': past_attention_mask},)
             return self._concatenate_to_cache(key, value, query, attention_mask, presets)
 
-        past_key = layer_past[0]['xk'] if layer_past is not None and 'xk' in layer_past[0] else torch.zeros(key.shape, dtype=key.dtype)
-        past_value = layer_past[0]['xv'] if layer_past is not None and 'xv' in layer_past[0] else torch.zeros(value.shape, dtype=key.dtype)
-        cache_mask = layer_past[0]['cache_mask'] if layer_past is not None and 'cache_mask' in layer_past[0] else torch.zeros(attention_mask.shape, dtype=key.dtype)
+        past_key = layer_past[0]['xk'] if layer_past is not None and 'xk' in layer_past[0] else torch.zeros(key.shape, dtype=key.dtype, device=self.device)
+        past_value = layer_past[0]['xv'] if layer_past is not None and 'xv' in layer_past[0] else torch.zeros(value.shape, dtype=key.dtype, device=self.device)
+        cache_mask = layer_past[0]['cache_mask'] if layer_past is not None and 'cache_mask' in layer_past[0] else torch.zeros(attention_mask.shape, dtype=key.dtype, device=self.device)
 
         # detect if we're initializing by absence of existing cache data.
         is_initialized = past_key is not None
@@ -809,7 +811,7 @@ def dense_init(input_tensor, config, is_embedding=False):
 
 class RPTCrossAttention(nn.Module):
 
-    def __init__(self, config: RPTConfig, dtype: torch.float32):
+    def __init__(self, config: RPTConfig, dtype: torch.float32, device=None):
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -856,6 +858,7 @@ class RPTCrossAttention(nn.Module):
             rot_dim,
             config.max_sequence_length * 2,
             dtype=self.dtype,
+            device=device,
         )
         self.null_k = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
         self.null_v = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
@@ -1017,13 +1020,14 @@ class RPTMLP(nn.Module):
 
 class RPTLowcoderLayer(nn.Module):
 
-    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, *args, **kwargs):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.config = config
         self.dtype = dtype
         self.attention = RPTAttention(
             self.config,
             dtype=self.dtype,
+            device=device,
         )
         self.feed_forward = RPTMLP(
             self.config,
@@ -1106,7 +1110,7 @@ class RPTLowcoderLayerCollection(nn.ModuleList):
     Basic series of masked attention encoders
     """
 
-    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, *args, **kwargs):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.config = config
         self.dtype = dtype
@@ -1116,7 +1120,8 @@ class RPTLowcoderLayerCollection(nn.ModuleList):
         self.blocks = nn.ModuleList([
             RPTLowcoderLayer(
                 self.config,
-                dtype=self.dtype
+                dtype=self.dtype,
+                device=device,
             ) for i in range(num_hidden_layers)
         ])
 
@@ -1185,11 +1190,11 @@ class RPTLowcoderLayerCollection(nn.ModuleList):
 
 class RPTLowcoder(nn.Module):
 
-    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, *args, **kwargs):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.config = config
         self.dtype = dtype
-        self.layers = RPTLowcoderLayerCollection(self.config, dtype=self.dtype)
+        self.layers = RPTLowcoderLayerCollection(self.config, dtype=self.dtype, device=device)
 
     def forward(
             self,
@@ -1227,13 +1232,13 @@ class RPTLowcoder(nn.Module):
 
 
 class RPTChunkedCrossAttention(nn.Module):
-    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, *args, **kwargs):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.config = config
         self.dtype = dtype
         self.chunk_size = self.config.chunk_size
         self.num_neighbors = self.config.num_neighbors
-        self.cross_attention = RPTCrossAttention(self.config, dtype=self.dtype)
+        self.cross_attention = RPTCrossAttention(self.config, dtype=self.dtype, device=device)
 
     def forward(
             self,
@@ -1510,16 +1515,16 @@ class RPTUpcoderLayerCollection(nn.Module):
 
 class RPTNeighborAugmentor(nn.Module):
 
-    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None):
         super().__init__()
         self.config = config
         self.dtype = dtype
-        self.postret_bidir_attention = RPTCrossAttention(self.config, dtype=self.dtype)
+        self.postret_bidir_attention = RPTCrossAttention(self.config, dtype=self.dtype, device=device)
         self.postret_bi_attention_norm = RPTRMSNorm(self.config, dtype=self.dtype)
         self.query_nei_xattention_qnorm = RPTRMSNorm(self.config, dtype=self.dtype)
         self.query_nei_xattention_knorm = RPTRMSNorm(self.config, dtype=self.dtype)
 
-        self.query_nei_xattention = RPTCrossAttention(self.config, dtype=self.dtype)
+        self.query_nei_xattention = RPTCrossAttention(self.config, dtype=self.dtype, device=device)
 
     def forward(self, hidden_states: torch.Tensor, neighbor_hidden_states: torch.Tensor, neighbor_mask: torch.Tensor, output_attentions: torch.Tensor, deterministic: bool,
                  query_hidden_states: torch.Tensor = None):
@@ -1562,11 +1567,11 @@ class RPTNeighborAugmentor(nn.Module):
 
 
 class RPTCrossNeighborAugmentor(nn.Module):
-    def __init__(self, config: RPTConfig, device_count, num_devices_chunks, num_neighbors, dtype: torch.dtype = torch.float32):
+    def __init__(self, config: RPTConfig, device_count, num_devices_chunks, num_neighbors, dtype: torch.dtype = torch.float32, device=None):
         super().__init__()
         self.config = config
         self.dtype = dtype
-        self.cross_neig_causal_att = RPTAttention(self.config, dtype=self.dtype)
+        self.cross_neig_causal_att = RPTAttention(self.config, dtype=self.dtype, device=device)
         self.xnei_norm1 = RPTRMSNorm(self.config, dtype=self.dtype)
         self.xnei_norm2 = RPTRMSNorm(self.config, dtype=self.dtype)
         # [device_count, num_devices_chunks*num_neighbors, 1]
@@ -1631,19 +1636,19 @@ class RPTCrossNeighborAugmentor(nn.Module):
 
 
 class RPTUpcoder(nn.Module):
-    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None):
         super().__init__()
         self.config = config
         self.dtype = dtype
 
         if self.config.augment_neighbors:
-            self.neighbor_augmentor = RPTNeighborAugmentor(self.config, dtype=self.dtype)
+            self.neighbor_augmentor = RPTNeighborAugmentor(self.config, dtype=self.dtype, device=device)
         else:
             self.neighbor_augmentor = None
 
         if self.config.augment_across_neighbors:
             # TODO: Fix parameters
-            self.neighbor_cross_augmentor = RPTCrossNeighborAugmentor(self.config, device_count=1, dtype=self.dtype, num_neighbors=self.config.num_neighbors, num_devices_chunks=self.config.num_document_chunks)
+            self.neighbor_cross_augmentor = RPTCrossNeighborAugmentor(self.config, device_count=1, dtype=self.dtype, device=device, num_neighbors=self.config.num_neighbors, num_devices_chunks=self.config.num_document_chunks)
         else:
             self.neighbor_cross_augmentor = None
         self.layers = RPTUpcoderLayerCollection(self.config, dtype=self.dtype)
@@ -1826,7 +1831,7 @@ class RPTRetriever(nn.Module):
 class RPTModule(nn.Module):
     base_model_prefix = 'transformer'
 
-    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None):
         super().__init__()
         self.config = config
         self.dtype = dtype
@@ -1849,13 +1854,13 @@ class RPTModule(nn.Module):
             dtype=self.dtype
         )
 
-        self.lowcoder = RPTLowcoder(self.config, dtype=self.dtype)
+        self.lowcoder = RPTLowcoder(self.config, dtype=self.dtype, device=device)
         if self.config.cca_freq is not None and self.config.cca_freq > 0:
             self.retriever = RPTRetriever(self.config, dtype=self.dtype)
         else:
             self.retriever = None
 
-        self.upcoder = RPTUpcoder(self.config, dtype=self.dtype)
+        self.upcoder = RPTUpcoder(self.config, dtype=self.dtype, device=device)
 
         # TODO: move this ln_f into the upcoder.
         self.ln_f = RPTRMSNorm(self.config, dtype=self.dtype)
@@ -1992,9 +1997,9 @@ class RPTPreTrainedModel(PreTrainedModel):
     config_class = RPTConfig
     module_class: nn.Module = None
 
-    def __init__(self, config: RPTConfig, input_shape=None, *inputs, **kwargs):
+    def __init__(self, config: RPTConfig, input_shape=None, device=None, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
-        self.module = self.module_class(config=config, **kwargs)
+        self.module = self.module_class(config=config, device=device, **kwargs)
         self.input_shape = input_shape
 
     def init_weights(self):
@@ -2336,7 +2341,7 @@ class RPTForCausalLMModule(nn.Module):
         lowcoder_outputs = self.transformer.lowcoder(
             self.transformer.wte(input_ids),
             None,
-            torch.Tensor(attention_mask),
+            attention_mask,
             init_cache=True,
             **kwargs
         )
@@ -2361,11 +2366,11 @@ class RPTForCausalLMModule(nn.Module):
             **kwargs
         )
 
-    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, *args, **kwargs):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.config = config
         self.dtype = dtype
-        self.transformer = RPTModule(self.config, dtype=self.dtype)
+        self.transformer = RPTModule(self.config, dtype=self.dtype, device=device)
         # TODO: initialize
         self.lm_head = nn.Linear(
             in_features=self.config.hidden_size,

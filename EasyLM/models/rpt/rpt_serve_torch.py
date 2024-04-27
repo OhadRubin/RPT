@@ -310,9 +310,9 @@ def main(argv):
     print(rpt_config)
     params = unfreeze(params)
 
-    hf_model = RPTForCausalLM(rpt_config)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    device = "cpu"
+    hf_model = RPTForCausalLM(rpt_config, device=device)
     hf_model.to(device)
 
     # TODO: Cringe
