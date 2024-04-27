@@ -312,6 +312,9 @@ def main(argv):
 
     hf_model = RPTForCausalLM(rpt_config)
 
+    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    hf_model.to(device)
+
     # TODO: Cringe
     gin.clear_config()
 
@@ -331,6 +334,7 @@ def main(argv):
 
     forward_loglikelihood = create_forward_loglikelihood(rpt_config, _forward_lowcoder, _forward_upcoder,
                                                          _forward_loglikelihood)
+
 
     def _forward_generate(batch, max_new_tokens, temperature, sample=True, past_key_values=None):
         if sample:
@@ -360,15 +364,6 @@ def main(argv):
                 return_dict_in_generate=True,
             ),
             )
-
-        def sample_search_cond_fn(state):
-            has_reached_max_length = state.cur_len % 64 == 0
-            all_sequence_finished = torch.all(state.is_sent_finished)
-            finish_generation = torch.logical_or(has_reached_max_length, all_sequence_finished)
-            return ~finish_generation
-
-        stopping_criteria = transformers.StoppingCriteriaList()
-        stopping_criteria.append(sample_search_cond_fn)
 
         output, encoded_lowcoder_states = hf_model.generate(
             torch.Tensor(batch['input_tokens']),

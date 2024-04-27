@@ -644,7 +644,7 @@ class RPTAttention(nn.Module):
                 torch.clip(torch.cumsum(attention_mask, dim=-1) - 1, min=0),
                 (batch_size, key_length)
             ).type(torch.int)
-            freqs_cis_k = np.take(self.freqs_cis, position_ids_k, axis=0)
+            freqs_cis_k = self.freqs_cis[position_ids_k]
             position_ids += position_ids_k.max() - position_ids.max()
         else:
             position_ids_k = position_ids
@@ -656,7 +656,7 @@ class RPTAttention(nn.Module):
             batch_size = batch_size * n_windows
             attention_mask = rearrange(attention_mask, 'b (s l) -> (b s) l', s=n_windows)
 
-        freqs_cis = np.take(self.freqs_cis, position_ids, axis=0)
+        freqs_cis = self.freqs_cis[position_ids]
 
         if layer_past is not None or presets is not None:
             causal_mask = make_attention_mask(position_ids, position_ids_k, lambda x, y: x >= y,
@@ -782,9 +782,9 @@ class RPTAttention(nn.Module):
         return outputs
 
     def concat_null_kv(self, xv, xk, attention_bias):
-        attention_bias_shape = torch.Tensor(np.array(attention_bias.shape)).type(torch.int)
+        attention_bias_shape = torch.tensor(attention_bias.shape).type(torch.int)
         attention_bias_shape[-1] = 1
-        xk_shape = torch.Tensor(np.array(xk.shape)).type(torch.int)
+        xk_shape = torch.tensor(xk.shape).type(torch.int)
         xk_shape[-3] = 1
 
         null_k = torch.broadcast_to(self.null_k, tuple(xk_shape))
@@ -897,16 +897,15 @@ class RPTCrossAttention(nn.Module):
             position_ids = torch.arange(query_length, dtype=torch.int32)
             position_ids = torch.broadcast_to(position_ids[None, :], (batch_size, query_length))
 
-        # TODO: get rid of numpy
-        freqs_cis = np.take(self.freqs_cis, position_ids, axis=0)
+        freqs_cis = self.freqs_cis[position_ids]
         if not is_cross_attention:
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, dtype=self.dtype, rot_dim=self.config.rot_dim)
         else:
             if kv_position_ids is None:
                 kv_position_ids = torch.arange(key_length, dtype=torch.int32)
                 kv_position_ids = torch.broadcast_to(kv_position_ids[None, :], (batch_size, key_length))
-            # TODO: Get rid of numpy
-            freqs_cis_k = np.take(self.freqs_cis, kv_position_ids, axis=0)
+            freqs_cis_k = self.freqs_cis[kv_position_ids]
+
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis, freqs_cis_k=freqs_cis_k, dtype=self.dtype,
                                       rot_dim=self.config.rot_dim)
 
@@ -2062,6 +2061,7 @@ class RPTPreTrainedModel(PreTrainedModel):
 
         return outputs
 
+    # TODO: Origianl usage
     def augment_forward(
             self,
             hidden_states,
@@ -2087,6 +2087,7 @@ class RPTPreTrainedModel(PreTrainedModel):
 
         return outputs, past_key_values.get("intermediates", None)
 
+    # TODO: Please look at the original usage
     def lowcoder_forward(
             self,
             input_ids,
