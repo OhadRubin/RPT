@@ -3,8 +3,7 @@ from collections import namedtuple
 
 import einops
 import gin
-import numpy as np
-import optax
+import numpy as np # TODO: Remove
 import torch
 import transformers
 from torch import nn
@@ -15,16 +14,13 @@ from typing import Optional, Tuple, Union, Dict, List
 from transformers import AutoTokenizer, StoppingCriteriaList
 from einops import rearrange
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPastAndCrossAttentions
+from transformers.generation.utils import GenerateNonBeamOutput
 
 from torch_utils import make_attention_mask, make_causal_mask, combine_masks, gelu, silu, assign_slice
 from dataclasses import dataclass
-from transformers import LogitsProcessorList
-import jax
 
 # used just for the attention function call
-import jax.numpy as jnp
-from flax.linen.attention import dot_product_attention_weights
-from EasyLM.memory_efficient_attention import dot_product_attention_multihead as efficient_dot_product_attention
+from EasyLM.torch_attn import dot_product_attention_weights
 
 
 RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])
@@ -107,7 +103,6 @@ class SampleState:
     sequences: torch.Tensor
     running_token: torch.Tensor
     is_sent_finished: torch.Tensor
-    prng_key: torch.Tensor
     model_kwargs: Dict[str, torch.Tensor]
 
 def m1_cosine_decay_schedule(
@@ -126,22 +121,6 @@ def m1_cosine_decay_schedule(
     return max_value*decayed
 
   return schedule
-
-def topk_chunks(retriever_scores,num_candidates,*,where=None):
-    # TODO: This used to have a @jax.vmap annotation on it, let's pytorch it
-    def _topk_chunks(retriever_scores):
-        return (-retriever_scores).argsort()[:num_candidates] #k = num_candidates
-    if where is not None:
-        retriever_scores = torch.where(where,retriever_scores,-torch.inf)
-    return _topk_chunks(retriever_scores)
-
-def create_segment_mask(total_num_chunks,n_skip_chunks):
-
-    # TODO: This used to have a @jax.vmap annotation on it, let's pytorch it
-    def _create_segment_mask(chunk_index):
-        max_chunk = n_skip_chunks*(chunk_index//n_skip_chunks)
-        return torch.arange(total_num_chunks)<max_chunk - 2
-    return _create_segment_mask(torch.arange(total_num_chunks))
 
 
 @gin.configurable
@@ -522,28 +501,28 @@ class RPTAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
 
         # TODO: DEVICE!!!
-        self.wq = torch.nn.Linear(
+        self.wq = nn.Linear(
             self.embed_dim,
             config.num_attention_heads * self.head_dim,
             bias=False,
             dtype=dtype
         )
 
-        self.wk = torch.nn.Linear(
+        self.wk = nn.Linear(
             self.embed_dim,
             config.num_attention_heads * self.head_dim,
             bias=False,
             dtype=dtype
         )
 
-        self.wv = torch.nn.Linear(
+        self.wv = nn.Linear(
             self.embed_dim,
             config.num_attention_heads * self.head_dim,
             bias=False,
             dtype=dtype
         )
 
-        self.wo = torch.nn.Linear(
+        self.wo = nn.Linear(
             self.embed_dim,
             config.num_attention_heads * self.head_dim,
             bias=False,
@@ -563,11 +542,11 @@ class RPTAttention(nn.Module):
             dtype=self.dtype,
         )
         if self.config.add_null_attn:
-            #self.null_k = self.param(f'null_k', torch.nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
-            #self.null_v = self.param(f'null_v', torch.nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
+            #self.null_k = self.param(f'null_k', nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
+            #self.null_v = self.param(f'null_v', nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
 
-            self.null_k = torch.nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
-            self.null_v = torch.nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
+            self.null_k = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
+            self.null_v = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
 
     def _split_heads(self, hidden_states):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
@@ -696,7 +675,6 @@ class RPTAttention(nn.Module):
 
         freqs_cis = np.take(self.freqs_cis, position_ids, axis=0)
 
-
         if layer_past is not None or presets is not None:
             causal_mask = make_attention_mask(position_ids, position_ids_k, lambda x, y: x >= y,
                                               extra_batch_dims=0, dtype=torch.bool)
@@ -724,8 +702,10 @@ class RPTAttention(nn.Module):
             xk = repeat_kv(xk, self.num_key_value_groups)
             xv = repeat_kv(xv, self.num_key_value_groups)
 
+        # TODO: Scan
         # usual dot product attention
         if self.config.scan_attention:
+            """
             attn_weights = None
             attention_mask = einops.rearrange(
                 combine_masks(attention_mask, fcm_mask),
@@ -750,6 +730,8 @@ class RPTAttention(nn.Module):
                 query_chunk_size=self.config.scan_query_chunk_size,
                 key_chunk_size=self.config.scan_key_chunk_size,
             )
+            """
+            pass
 
         else:
             if sliding_window and n_windows > 1:
@@ -770,17 +752,13 @@ class RPTAttention(nn.Module):
             if self.config.add_null_attn:
                 xv, xk, attention_bias = self.concat_null_kv(xv, xk, attention_bias)
 
-            # xq = torch.Size([1, 1024, 32, 128])
-            # xk = torch.Size([1, 1024, 32, 128])
-            # xv = torch.Size([1, 1024, 32, 128])
-            # attention_mask = torch.Size([1, 1, 1024, 1024])
-            # attn_pdrop = 0
 
+            """
             dropout_rng = None
             if not deterministic and self.config.attn_pdrop > 0.0:
                 dropout_rng = jax.random.key(0)
 
-            attn_weights = dot_product_attention_weights(
+            attn_weights = flax_dot_product_attention_weights(
                 jnp.array(xq.detach().numpy()),
                 jnp.array(xk.detach().numpy()),
                 bias=jnp.array(attention_bias.detach().numpy()),
@@ -789,8 +767,20 @@ class RPTAttention(nn.Module):
                 deterministic=deterministic,
                 dtype=jnp.float32,
             )
-
+            
             attn_weights = torch.Tensor(attn_weights.tolist())
+            """
+
+            # TODO: Handle dropout
+            attn_weights = dot_product_attention_weights(
+                xq,
+                xk,
+                bias=attention_bias,
+                dropout_rate=self.config.attn_pdrop,
+                deterministic=deterministic,
+                dtype=self.dtype,
+            )
+
             print(f"{attn_weights.shape=}")
             attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv)
             if sliding_window and n_windows > 1:
@@ -828,11 +818,11 @@ class RPTAttention(nn.Module):
 def dense_init(input_tensor, config, is_embedding=False):
     if config.palm_init:
         if is_embedding:
-            return torch.nn.init.normal(tensor=input_tensor, std=1.0)
+            return nn.init.normal(tensor=input_tensor, std=1.0)
         # TODO: The use of len needs more examination
-        return torch.nn.init.normal(tensor=input_tensor, std=torch.sqrt(config.initializer_range / len(input_tensor)))
+        return nn.init.normal(tensor=input_tensor, std=torch.sqrt(config.initializer_range / len(input_tensor)))
     else:
-        return torch.nn.init.normal(tensor=input_tensor, std=config.initializer_range)
+        return nn.init.normal(tensor=input_tensor, std=config.initializer_range)
 
 
 class RPTCrossAttention(nn.Module):
@@ -845,28 +835,28 @@ class RPTCrossAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = self.embed_dim // self.num_heads
 
-        self.wq = torch.nn.Linear(
+        self.wq = nn.Linear(
             self.embed_dim,
             config.num_attention_heads * self.head_dim,
             bias=False,
             dtype=dtype
         )
 
-        self.wk = torch.nn.Linear(
+        self.wk = nn.Linear(
             self.embed_dim,
             config.num_attention_heads * self.head_dim,
             bias=False,
             dtype=dtype
         )
 
-        self.wv = torch.nn.Linear(
+        self.wv = nn.Linear(
             self.embed_dim,
             config.num_attention_heads * self.head_dim,
             bias=False,
             dtype=dtype
         )
 
-        self.wo = torch.nn.Linear(
+        self.wo = nn.Linear(
             self.embed_dim,
             config.num_attention_heads * self.head_dim,
             bias=False,
@@ -885,8 +875,8 @@ class RPTCrossAttention(nn.Module):
             config.max_sequence_length * 2,
             dtype=self.dtype,
         )
-        self.null_k = torch.nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
-        self.null_v = torch.nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
+        self.null_k = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
+        self.null_v = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
 
 
     def _split_heads(self, hidden_states):
@@ -948,18 +938,19 @@ class RPTCrossAttention(nn.Module):
             attention_mask = torch.concatenate((attention_mask, null_mask), dim=-1)
             attention_mask = attention_mask.unsqueeze(-2).unsqueeze(-2)
 
-            # attention_mask.shape = (16, 1, 1, 65)
             attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype)
             attention_bias[attention_mask > 0] = 0.0
         else:
             attention_bias = None
 
+
+        """
         # TODO: Get rid of JAX
         dropout_rng = None
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
 
-        attn_weights = dot_product_attention_weights(
+        attn_weights = flax_dot_product_attention_weights(
             jnp.array(xq.detach().numpy()),
             jnp.array(xk.detach().numpy()),
             bias=None if attention_bias is None else jnp.array(attention_bias.detach().numpy()),
@@ -969,7 +960,18 @@ class RPTCrossAttention(nn.Module):
             dtype=jnp.float32,
             precision=None,
         )
+        
         attn_weights = torch.Tensor(attn_weights.tolist())
+        """
+
+        attn_weights = dot_product_attention_weights(
+            xq,
+            xk,
+            bias=attention_bias,
+            dropout_rate=self.config.attn_pdrop,
+            deterministic=deterministic,
+            dtype=self.dtype,
+        )
 
         attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv)
 
@@ -1080,7 +1082,7 @@ class RPTLowcoderLayer(nn.Module):
         # nomalize hidden states
         feed_forward_input = self.ffn_norm(hidden_states)
 
-        # TODO: is this syntax or is it real?
+        # TODO: Torch doesn't have a scan yet: https://github.com/pytorch/pytorch/pull/119430
         # run the nomlaized hidden states into the MLP
         if self.config.scan_mlp:
             feed_forward_input = einops.rearrange(
@@ -1394,6 +1396,7 @@ class RPTUpcoderLayer(nn.Module):
 
         feed_forward_input = self.ffn_norm(hidden_states)
 
+        # TODO: PyTorch scan
         if self.config.scan_mlp:
             feed_forward_input = einops.rearrange(
                 feed_forward_input,
@@ -1406,7 +1409,6 @@ class RPTUpcoderLayer(nn.Module):
 
             scan_axis = feed_forward_input.ndim - 3
 
-            # TODO: handle
             _, feed_forward_hidden_states = nn.scan(
                 mlp_forward,
                 variable_broadcast="params",
@@ -1591,7 +1593,7 @@ class RPTCrossNeighborAugmentor(nn.Module):
         # TODO: missing in_features, need to run to figure out
         self.weight = nn.Linear(in_features=self.config.hidden_size, out_features=1, dtype=self.dtype, bias=True)
         if self.config.use_xnei_bias:
-            self.xnei_bias = torch.nn.Parameter(torch.normal(mean=0, std=0.01, size=(1, 1, 1, self.config.hidden_size)))
+            self.xnei_bias = nn.Parameter(torch.normal(mean=0, std=0.01, size=(1, 1, 1, self.config.hidden_size)))
         else:
             self.xnei_bias = None
 
@@ -1767,6 +1769,7 @@ class RPTUpcoder(nn.Module):
         )
 
 
+# TODO: Is this a module in inference?
 class RPTRetriever(nn.Module):
     def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
@@ -2139,40 +2142,40 @@ class RPTPreTrainedModel(PreTrainedModel):
             return padded_arr
 
 
+    """
     def sample(
-            self,
-            input_ids: torch.LongTensor,
-            logits_processor: Optional[LogitsProcessorList] = None,
-            stopping_criteria: Optional[StoppingCriteriaList] = None,
-            logits_warper: Optional[LogitsProcessorList] = None,
-            max_length: Optional[int] = None,
-            pad_token_id: Optional[int] = None,
-            eos_token_id: Optional[Union[int, List[int]]] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            output_scores: Optional[bool] = None,
-            output_logits: Optional[bool] = None,
-            return_dict_in_generate: Optional[bool] = None,
-            synced_gpus: bool = False,
-            streamer: Optional["BaseStreamer"] = None,
-            **model_kwargs,
-    ):
+        self,
+        input_ids: torch.LongTensor,
+        logits_processor: Optional[LogitsProcessorList] = None,
+        stopping_criteria: Optional[StoppingCriteriaList] = None,
+        logits_warper: Optional[LogitsProcessorList] = None,
+        max_length: Optional[int] = None,
+        pad_token_id: Optional[int] = None,
+        eos_token_id: Optional[Union[int, List[int]]] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_scores: Optional[bool] = None,
+        output_logits: Optional[bool] = None,
+        return_dict_in_generate: Optional[bool] = None,
+        synced_gpus: bool = False,
+        streamer: Optional["BaseStreamer"] = None,
+        **model_kwargs,
+    ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         # init values
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
-        prng_key = jax.random.PRNGKey(0)
 
         batch_size, cur_len = input_ids.shape
 
-        eos_token_id = jnp.array(eos_token_id, dtype=jnp.int32 if eos_token_id is not None else None)
-        pad_token_id = jnp.array(pad_token_id, dtype=jnp.int32)
-        cur_len = jnp.array(cur_len)
+        eos_token_id = torch.tensor(eos_token_id, dtype=torch.int32 if eos_token_id is not None else None)
+        pad_token_id = torch.tensor(pad_token_id, dtype=torch.int32)
+        cur_len = torch.tensor(cur_len)
 
         # per batch-item holding current token in loop.
         sequences = input_ids
 
         # per batch-item state bit indicating if sentence has finished.
-        is_sent_finished = jnp.zeros((batch_size,), dtype=jnp.bool_)
+        is_sent_finished = torch.zeros((batch_size,), dtype=torch.bool)
 
         # For Seq2Seq generation, we only need to use the decoder instead of the whole model in generation loop
         # and pass it the `encoder_outputs`, which are part of the `model_kwargs`.
@@ -2187,18 +2190,10 @@ class RPTPreTrainedModel(PreTrainedModel):
             sequences=sequences,
             running_token=input_ids,
             is_sent_finished=is_sent_finished,
-            prng_key=prng_key,
             model_kwargs=model_kwargs,
         )
 
-        def sample_search_cond_fn(state):
-            has_reached_max_length = state.cur_len % 64 == 0
-            all_sequence_finished = jnp.all(state.is_sent_finished)
-            finish_generation = jnp.logical_or(has_reached_max_length, all_sequence_finished)
-            return ~finish_generation
-
         def sample_search_body_fn(state):
-            prng_key, prng_key_next = jax.random.split(state.prng_key)
             model_outputs = model(state.running_token, **state.model_kwargs)
 
             logits = model_outputs.logits[:, -1]
@@ -2208,10 +2203,9 @@ class RPTPreTrainedModel(PreTrainedModel):
             # apply top_p, top_k, temperature
             logits = logits_warper(logits, logits)
 
-            # 5295
-            # Array([4146024105,  967050713], dtype=uint32) -> 1383
-            # 8 -> 8.617962
-            next_token = jax.random.categorical(prng_key, logits.numpy(), axis=-1)
+            # TODO: Pytorch?
+            probs = nn.functional.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).squeeze(1)
 
             next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
             next_token = next_token * ~next_is_sent_finished + pad_token_id * next_is_sent_finished
@@ -2226,14 +2220,13 @@ class RPTPreTrainedModel(PreTrainedModel):
                 running_token=torch.Tensor(next_token.tolist()),
                 is_sent_finished=next_is_sent_finished,
                 model_kwargs=next_model_kwargs,
-                prng_key=prng_key_next,
             )
 
         # The very first prompt often has sequence length > 1, so run outside of `lax.while_loop` to comply with TPU
         if input_ids.shape[1] > 1:
             state = sample_search_body_fn(state)
 
-        while sample_search_cond_fn(state):
+        while stopping_criteria(state):
             state = sample_search_body_fn(state)
 
         last_lowcoder_states = self.module.transformer.cached_array
@@ -2243,6 +2236,7 @@ class RPTPreTrainedModel(PreTrainedModel):
             attention_mask=torch.ones(last_lowcoder_states.shape[:-1]))
 
         return state, encoded_lowcoder_states
+    """
 
 
 
@@ -2405,6 +2399,7 @@ class RPTForCausalLM(RPTPreTrainedModel):
         #    past_key_values = self.init_cache(batch_size, self.config.window_length)
 
         return {
+            "input_ids": input_ids,
             "past_key_values": past_key_values,
             "encoded_neighbors": encoded_neighbors,
             "attention_mask": attention_mask,

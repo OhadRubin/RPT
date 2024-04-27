@@ -1,7 +1,5 @@
 import os
-
 import transformers
-
 from EasyLM.jax_utils import unfreeze
 
 if "DEBUG" in os.environ:
@@ -22,7 +20,6 @@ from EasyLM.models.rpt.memory_torch import Memory
 import gin
 import tqdm
 import absl
-
 import torch
 
 absl.flags.DEFINE_multi_string(
@@ -294,8 +291,6 @@ def rolling_iterator(tokenizer, text, input_length):
         yield batch
 
 
-import copy
-
 
 def main(argv):
     gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
@@ -366,8 +361,17 @@ def main(argv):
                 do_sample=False,
                 num_beams=1,
                 return_dict_in_generate=True,
-            ),
+                ),
             )
+
+        def sample_search_cond_fn(state):
+            has_reached_max_length = state.cur_len % 64 == 0
+            all_sequence_finished = torch.all(state.is_sent_finished)
+            finish_generation = torch.logical_or(has_reached_max_length, all_sequence_finished)
+            return ~finish_generation
+
+        stopping_criteria = transformers.StoppingCriteriaList()
+        stopping_criteria.append(sample_search_cond_fn)
 
         output, encoded_lowcoder_states = hf_model.generate(
             torch.Tensor(batch['input_tokens']),
@@ -375,6 +379,7 @@ def main(argv):
             encoded_neighbors=batch.get("encoded_neighbors", None),
             past_key_values=past_key_values,  # passing the initilized cache
             max_new_tokens=1,
+            #stopping_criteria=stopping_criteria,
             **generate_kwargs
         )
         sequences = output.sequences[:, batch['input_tokens'].shape[1]:]
