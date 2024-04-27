@@ -31,8 +31,9 @@ EncodedNeighbors = namedtuple('EncodedNeighbors', ['neighbor_hidden_states', 'ne
 
 
 
+
 @dataclass
-class FlaxRPTRetrieverEncodedOutput:
+class RPTRetrieverEncodedOutput:
     original_hidden_states: torch.Tensor = None
     encoded_hidden_states: torch.Tensor = None
     attention_mask: torch.Tensor = None
@@ -44,19 +45,7 @@ class FlaxRPTRetrieverEncodedOutput:
 
 
 @dataclass
-class FlaxRPTRetrieverEncodedOutput:
-    original_hidden_states: torch.Tensor = None
-    encoded_hidden_states: torch.Tensor = None
-    attention_mask: torch.Tensor = None
-    key_chunks: torch.Tensor = None
-    query_chunks: torch.Tensor = None
-    chunk_mask: torch.Tensor = None
-    preret_attention: Optional[torch.Tensor] = None
-    position_ids: Optional[torch.Tensor] = None
-
-
-@dataclass
-class FlaxRPTRetrieverNeighborOutput:
+class RPTRetrieverNeighborOutput:
     aux_loss: torch.Tensor = None
     loss_scale: torch.Tensor = None
     neighbor_hidden_states: torch.Tensor = None
@@ -65,7 +54,7 @@ class FlaxRPTRetrieverNeighborOutput:
 
 
 @dataclass
-class FlaxRPTLowcoderRetrieverEncodedOutput:
+class RPTLowcoderRetrieverEncodedOutput:
     hidden_states: torch.Tensor = None
     attention_mask: torch.Tensor = None
     neighbor_hidden_states: torch.Tensor = None
@@ -73,7 +62,7 @@ class FlaxRPTLowcoderRetrieverEncodedOutput:
 
 
 @dataclass
-class FlaxRPTModelOutput:
+class RPTModelOutput:
     last_hidden_state: torch.Tensor = None
     past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None
     upcoder_hidden_states: Optional[Tuple[torch.Tensor]] = None
@@ -82,12 +71,12 @@ class FlaxRPTModelOutput:
     lowcoder_last_hidden_state: Optional[torch.Tensor] = None
     lowcoder_hidden_states: Optional[Tuple[torch.Tensor]] = None
     lowcoder_attentions: Optional[Tuple[torch.Tensor]] = None
-    retriever_output: FlaxRPTRetrieverNeighborOutput = None
+    retriever_output: RPTRetrieverNeighborOutput = None
     retriever_input: Optional[torch.Tensor] = None
 
 
 @dataclass
-class FlaxRPTLMOutput(transformers.utils.ModelOutput):
+class RPTLMOutput(transformers.utils.ModelOutput):
     logits: torch.Tensor = None
     past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None
     upcoder_hidden_states: Optional[Tuple[torch.Tensor]] = None
@@ -96,17 +85,8 @@ class FlaxRPTLMOutput(transformers.utils.ModelOutput):
     lowcoder_last_hidden_state: Optional[torch.Tensor] = None
     lowcoder_hidden_states: Optional[Tuple[torch.Tensor]] = None
     lowcoder_attentions: Optional[Tuple[torch.Tensor]] = None
-    retriever_output: FlaxRPTRetrieverNeighborOutput = None
+    retriever_output: RPTRetrieverNeighborOutput = None
     retriever_input: Optional[torch.Tensor] = None
-
-
-@dataclass
-class SampleState:
-    cur_len: torch.Tensor
-    sequences: torch.Tensor
-    running_token: torch.Tensor
-    is_sent_finished: torch.Tensor
-    model_kwargs: Dict[str, torch.Tensor]
 
 def m1_cosine_decay_schedule(
     decay_steps: int,
@@ -1832,7 +1812,7 @@ class RPTRetriever(nn.Module):
         original_hidden_states = original_hidden_states.reshape(original_hidden_states_shape)
         attention_mask = attention_mask.reshape(original_attention_mask_shape)
 
-        return FlaxRPTRetrieverEncodedOutput(
+        return RPTRetrieverEncodedOutput(
             original_hidden_states=original_hidden_states,
             encoded_hidden_states=encoded_hidden_states,
             attention_mask=attention_mask,
@@ -1985,7 +1965,7 @@ class RPTModule(nn.Module):
         if not return_dict:
             return (hidden_states,) + upcoder_outputs + lowcoder_outputs, past_key_values # TODO: Cringe
 
-        return FlaxRPTModelOutput(
+        return RPTModelOutput(
             past_key_values=past_key_values,
             last_hidden_state=upcoder_outputs.last_hidden_state,
             upcoder_hidden_states=upcoder_outputs.hidden_states,
@@ -2449,7 +2429,7 @@ class RPTForCausalLMModule(nn.Module):
 
         if not return_dict:
             return (lm_logits,) + outputs[1:] # TODO: Handle cache
-        return FlaxRPTLMOutput(
+        return RPTLMOutput(
             logits=lm_logits,
             upcoder_hidden_states=outputs.upcoder_hidden_states,
             upcoder_attentions=outputs.upcoder_attentions,

@@ -14,7 +14,7 @@ import optax
 from transformers import GenerationConfig
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.serving import LMServer
-from EasyLM.models.rpt.rpt_model_torch import RPTConfig, RPTForCausalLM, FlaxRPTLowcoderRetrieverEncodedOutput, \
+from EasyLM.models.rpt.rpt_model_torch import RPTConfig, RPTForCausalLM, RPTLowcoderRetrieverEncodedOutput, \
     EncodedNeighbors
 from EasyLM.models.rpt.memory_torch import Memory
 import gin
@@ -181,7 +181,7 @@ def create_forward_loglikelihood(config, low_fwd, up_fwd, fwd):
             query_chunks=outputs.query_chunks,
         )
         batch.update(
-            upcoder_input=FlaxRPTLowcoderRetrieverEncodedOutput(
+            upcoder_input=RPTLowcoderRetrieverEncodedOutput(
                 hidden_states=outputs.original_hidden_states,
                 attention_mask=outputs.attention_mask,
                 neighbor_hidden_states=neighbor_hidden_states,
