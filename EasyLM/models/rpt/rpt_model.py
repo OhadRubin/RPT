@@ -1578,7 +1578,6 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
         def sample_search_body_fn(state):
             """state update fn."""
             prng_key, prng_key_next = jax.random.split(state.prng_key)
-            ###jax.debug.print('input_ids.shape: {input_ids}', input_ids=state.running_token)
             model_outputs = model(state.running_token, params=params, **state.model_kwargs)
 
             logits = model_outputs.logits[:, -1]
@@ -1588,12 +1587,7 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
             # apply top_p, top_k, temperature
             logits = logits_warper(logits, logits, state.cur_len)
 
-            # 5295
             next_token = jax.random.categorical(prng_key, logits, axis=-1)
-
-            # 5295
-            # Array([4146024105,  967050713], dtype=uint32) -> 1383
-            # 8 -> 8.617962
 
             next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
             next_token = next_token * ~next_is_sent_finished + pad_token_id * next_is_sent_finished

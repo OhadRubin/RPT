@@ -333,9 +333,6 @@ def main(argv):
                                                          _forward_loglikelihood)
 
     def _forward_generate(batch, max_new_tokens, temperature, sample=True, past_key_values=None):
-        if past_key_values is None:
-            past_key_values = {'lowcoder': None, 'upcoder': None, 'augment': None}
-
         if sample:
             generate_kwargs = dict(
                 logits_processor=transformers.LogitsProcessorList(
@@ -361,7 +358,7 @@ def main(argv):
                 do_sample=False,
                 num_beams=1,
                 return_dict_in_generate=True,
-                ),
+            ),
             )
 
         def sample_search_cond_fn(state):
@@ -378,12 +375,10 @@ def main(argv):
             attention_mask=torch.Tensor(batch['input_mask']).type(torch.int),
             encoded_neighbors=batch.get("encoded_neighbors", None),
             past_key_values=past_key_values,  # passing the initilized cache
-            max_new_tokens=1,
-            #stopping_criteria=stopping_criteria,
             **generate_kwargs
         )
         sequences = output.sequences[:, batch['input_tokens'].shape[1]:]
-        return sequences.type(torch.int), output.model_kwargs['past_key_values'], encoded_lowcoder_states
+        return sequences.type(torch.int), output.past_key_values, encoded_lowcoder_states
 
     if FLAGS.iterative_mode:
         prefix_forward_generate = _forward_generate
