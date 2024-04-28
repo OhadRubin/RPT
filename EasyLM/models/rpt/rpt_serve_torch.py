@@ -100,9 +100,7 @@ def apply_forward_loglikelihood(hf_model,
                                 output_mask,
                                 ):
     outputs, past_key_values = hf_model.module(
-        input_tokens, attention_mask=input_mask,
-        deterministic=True,
-        mutable=['cache']
+        input_tokens, attention_mask=input_mask, deterministic=True
     )
     output = process_logits(output_tokens, output_mask, outputs.logits)
     #past_key_values = unfreeze(past_key_values).get("cache", None)
@@ -136,11 +134,12 @@ def apply_forward_augment(hf_model, hidden_states, neighbor_hidden_states, neigh
     return outputs, {'augment': past_key_values}
 
 
-def _loglikelihood_rolling(tokenizer, params, text, func, nearest_chunk_distance, num_neighbors=2, input_length=1024,
+def _loglikelihood_rolling(tokenizer, hf_model, text, func, nearest_chunk_distance, num_neighbors=2, input_length=1024,
                            verbose=True, return_scores=False):
     memory = Memory(chunk_size=64, num_neighbors=num_neighbors, nearest_chunk_distance=nearest_chunk_distance,
                     return_scores=return_scores)
     #params.update(cache=jax.tree_map(lambda x: jnp.zeros_like(x), params['cache']))
+    # TODO: cache intitialization
 
     loglikelihood_list = []
     total_loglikelihood = 0.0
@@ -152,7 +151,7 @@ def _loglikelihood_rolling(tokenizer, params, text, func, nearest_chunk_distance
         token_count += batch['output_mask'].sum(-1)
 
         (loglikelihood, is_greedy), metadata = func(
-            params, batch, memory
+            hf_model, batch, memory
         )
         metadata_list += (metadata,)
         total_loglikelihood += loglikelihood
@@ -166,9 +165,7 @@ def _loglikelihood_rolling(tokenizer, params, text, func, nearest_chunk_distance
 def create_forward_loglikelihood(config, low_fwd, up_fwd, fwd):
     def forward_loglikelihood_no_mem(params, batch, memory):
         outputs, past_key_values = fwd(params, batch)
-        if past_key_values is not None:
-            params.update(cache=past_key_values)
-        return outputs, None
+        return outputs, past_key_values
 
     def forward_loglikelihood_w_mem(params, batch, memory):
         outputs, past_key_values = low_fwd(params, batch)
@@ -314,6 +311,7 @@ def main(argv):
 
     hf_model = RPTForCausalLM(rpt_config, device=device)
     hf_model.to(device)
+
 
     # TODO: Cringe
     gin.clear_config()

@@ -18,7 +18,7 @@ from transformers.generation import validate_stopping_criteria
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPastAndCrossAttentions
 from transformers.generation.utils import GenerateNonBeamOutput, GenerateDecoderOnlyOutput, GenerateEncoderDecoderOutput
 
-from torch_utils import make_attention_mask, make_causal_mask, combine_masks, gelu, silu, assign_slice
+from EasyLM.torch_utils import make_attention_mask, make_causal_mask, combine_masks, gelu, silu, assign_slice
 from dataclasses import dataclass
 
 # used just for the attention function call
