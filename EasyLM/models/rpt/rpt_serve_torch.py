@@ -83,7 +83,7 @@ def apply_forward_upcoder(hf_model,
                           output_mask,
                           upcoder_input
                           ):
-    outputs, past_key_values = hf_model.module(input_tokens, attention_mask=input_mask,
+    outputs, past_key_values = hf_model(input_tokens, attention_mask=input_mask,
         upcoder_input=upcoder_input,
         deterministic=True,
         mutable=['cache', 'intermediates']
@@ -99,7 +99,7 @@ def apply_forward_loglikelihood(hf_model,
                                 output_tokens,
                                 output_mask,
                                 ):
-    outputs, past_key_values = hf_model.module(
+    outputs, past_key_values = hf_model(
         input_tokens, attention_mask=input_mask, deterministic=True
     )
     output = process_logits(output_tokens, output_mask, outputs.logits)
@@ -111,7 +111,7 @@ def apply_forward_loglikelihood(hf_model,
 def apply_forward_lowcoder(hf_model, input_tokens, input_mask, **kwargs):
     # TODO: Apply and other parameters
     # TODO: Output attention
-    outputs, past_key_values = hf_model.module._lowcoder_forward(
+    outputs, past_key_values = hf_model._lowcoder_forward(
         input_ids=input_tokens,
         attention_mask=input_mask,
         deterministic=True,
@@ -122,7 +122,7 @@ def apply_forward_lowcoder(hf_model, input_tokens, input_mask, **kwargs):
 
 
 def apply_forward_augment(hf_model, hidden_states, neighbor_hidden_states, neighbor_mask, past_key_values):
-    outputs, past_key_values = hf_model.module._augment_forward(
+    outputs, past_key_values = hf_model._augment_forward(
         hidden_states=hidden_states,
         neighbor_hidden_states=neighbor_hidden_states,
         neighbor_mask=neighbor_mask,
@@ -323,7 +323,10 @@ def main(argv):
         del params['params']['transformer'][key_to_modify]['layers']
         params['params']['transformer'][key_to_modify]['layers'] = {'blocks': layers }
 
-    load_flax_weights_in_pytorch_model(hf_model.module.transformer, params['params'])
+    load_flax_weights_in_pytorch_model(hf_model, params['params'])
+
+    hf_model.save_pretrained('rpt-torch-1')
+    hf_model.from_pretrained('rpt-torch-1')
 
     _forward_upcoder = apply_forward_upcoder
     _forward_loglikelihood = apply_forward_loglikelihood

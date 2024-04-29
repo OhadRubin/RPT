@@ -7,14 +7,14 @@ import einops
 import gin
 import torch
 import transformers
-from torch import nn
+from torch import nn, Tensor, LongTensor
 from transformers.configuration_utils import PretrainedConfig
 from mlxu import function_args_to_config, load_pickle, open_file
 from ml_collections import ConfigDict
-from typing import Optional, Tuple, Union, Dict, List
+from typing import Optional, Tuple, Union, Dict, List, Any
 from transformers import AutoTokenizer, StoppingCriteriaList
 from einops import rearrange
-from transformers.generation import validate_stopping_criteria
+from transformers.generation import validate_stopping_criteria, GenerateEncoderDecoderOutput, GenerateDecoderOnlyOutput
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPastAndCrossAttentions
 from transformers.generation.utils import GenerateNonBeamOutput, GenerateDecoderOnlyOutput, GenerateEncoderDecoderOutput
 
@@ -483,7 +483,6 @@ class RPTAttention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.device = device
 
-        # TODO: DEVICE!!!
         self.wq = nn.Linear(
             self.embed_dim,
             config.num_attention_heads * self.head_dim,
@@ -602,7 +601,6 @@ class RPTAttention(nn.Module):
 
         return key, value, attention_mask
 
-    # TODO: Remember you removed to position_id parameter
     def forward(
             self,
             hidden_states,
@@ -629,7 +627,7 @@ class RPTAttention(nn.Module):
         query_attention_mask = attention_mask
 
         presets = None
-        if layer_past is not None or init_cache and not disable_cache:
+        if True: # TODO: Make this more subtle like the original :) #if (layer_past is not None or init_cache) and not disable_cache:
             xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask, layer_past)
             presets = ({'xk': xk, 'xv': xv, 'cache_mask': attention_mask},)
 
@@ -1498,7 +1496,6 @@ class RPTUpcoderLayerCollection(nn.Module):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        # this contains possible `None` values - `FlaxGPTJModule` will filter them out
         outputs = (hidden_states, all_hidden_states, all_attentions)
 
         if not return_dict:
@@ -1828,161 +1825,7 @@ class RPTRetriever(nn.Module):
 
 # TODO: Figure out the PyTorch version
 
-class RPTModule(nn.Module):
-    base_model_prefix = 'transformer'
 
-    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None):
-        super().__init__()
-        self.config = config
-        self.dtype = dtype
-        # the embedding dim
-        self.embed_dim = self.config.hidden_size
-
-        # TODO: Comon size
-        self.cached_array = torch.zeros(size=(1, config.chunk_size, config.hidden_size), dtype=self.dtype)
-
-        # TODO: move this wte and dropout into the lowcoder.
-
-        # define a dropout layer
-        self.dropout = nn.Dropout(p=self.config.embd_pdrop)
-
-        # TODO: handle init
-        # word to embedding module (layer)
-        self.wte = nn.Embedding(
-            self.config.vocab_size,  # input size
-            self.config.hidden_size,  # embedding size
-            dtype=self.dtype
-        )
-
-        self.lowcoder = RPTLowcoder(self.config, dtype=self.dtype, device=device)
-        if self.config.cca_freq is not None and self.config.cca_freq > 0:
-            self.retriever = RPTRetriever(self.config, dtype=self.dtype)
-        else:
-            self.retriever = None
-
-        self.upcoder = RPTUpcoder(self.config, dtype=self.dtype, device=device)
-
-        # TODO: move this ln_f into the upcoder.
-        self.ln_f = RPTRMSNorm(self.config, dtype=self.dtype)
-
-    # TODO: Verify correctness
-    def _concatenate_to_lowcoder_cache(self, array):
-        *batch_dims, _, hidden_dim = array.shape
-        chunk_size = self.config.chunk_size
-
-        last_chunk = array[..., -chunk_size:, :]
-
-        num_updated_cache_vectors = last_chunk.shape[-2]
-        shift = self.config.chunk_size - num_updated_cache_vectors  # will need to update if I change retrieval stride
-        indices = tuple([slice(None)] * len(batch_dims)) + (slice(shift, None), slice(None))
-
-        self.cached_array = torch.roll(self.cached_array, shifts=-num_updated_cache_vectors, dims=-2)
-        self.cached_array[indices] = last_chunk
-
-
-    def forward(
-            self,
-            input_ids,
-            past_key_values,
-            attention_mask,
-            position_ids,
-            deterministic=True,
-            retriever_supervision: RetrieverSupervision = None,
-            train_step: Optional[int] = None,
-            init_cache: bool = False,
-            output_attentions: bool = False,
-            output_hidden_states: bool = False,
-            return_dict: bool = True,
-            upcoder_input=None,
-            encoded_neighbors: Optional[EncodedNeighbors] = None,
-    ):
-        lowcoder_outputs = None
-        retriever_output = None
-        neighbor_hidden_states = None
-        neighbor_mask = None
-        chunk_index = None
-        retriever_input = None
-
-        if upcoder_input is None:
-
-            input_embeds = self.wte(input_ids)
-
-            # TODO: Determinsitc
-            hidden_states = self.dropout(input_embeds)
-
-            lowcoder_outputs = self.lowcoder(
-                hidden_states,
-                past_key_values['lowcoder'],
-                attention_mask,
-                position_ids=position_ids,
-                deterministic=deterministic,
-                init_cache=init_cache,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-
-            hidden_states = lowcoder_outputs.last_hidden_state if return_dict else lowcoder_outputs[0]
-            self._concatenate_to_lowcoder_cache(hidden_states)
-
-            retriever_input = hidden_states
-            if self.retriever is not None:
-                if encoded_neighbors is not None:
-                    neighbor_hidden_states = encoded_neighbors.neighbor_hidden_states
-                    neighbor_mask = encoded_neighbors.neighbor_mask
-                    chunk_index = encoded_neighbors.chunk_index
-                else:
-                    retriever_output = self.retriever(hidden_states=retriever_input,
-                                                      attention_mask=attention_mask,
-                                                      retriever_supervision=retriever_supervision,
-                                                      deterministic=deterministic,
-                                                      train_step=train_step)
-                    neighbor_hidden_states = retriever_output.neighbor_hidden_states
-                    neighbor_mask = retriever_output.neighbor_mask
-        else:
-            hidden_states = upcoder_input.hidden_states
-            attention_mask = upcoder_input.attention_mask
-            neighbor_hidden_states = upcoder_input.neighbor_hidden_states
-            neighbor_mask = upcoder_input.neighbor_mask
-
-        upcoder_outputs = self.upcoder(
-            hidden_states,
-            past_key_values,
-            attention_mask,
-            position_ids=position_ids,
-            neighbor_hidden_states=torch.Tensor(neighbor_hidden_states),
-            neighbor_mask=torch.Tensor(neighbor_mask),
-            chunk_index=chunk_index,
-            deterministic=deterministic,
-            init_cache=init_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        hidden_states = upcoder_outputs.last_hidden_state if return_dict else upcoder_outputs[0]
-        hidden_states = self.ln_f(hidden_states)
-
-        past_key_values = {**lowcoder_outputs.past_key_values, **upcoder_outputs.past_key_values}
-
-        if not return_dict:
-            return (hidden_states,) + upcoder_outputs + lowcoder_outputs, past_key_values # TODO: Cringe
-
-        return RPTModelOutput(
-            past_key_values=past_key_values,
-            last_hidden_state=upcoder_outputs.last_hidden_state,
-            upcoder_hidden_states=upcoder_outputs.hidden_states,
-            upcoder_attentions=upcoder_outputs.attentions,
-            cross_attentions=None,
-            lowcoder_last_hidden_state=lowcoder_outputs.last_hidden_state if lowcoder_outputs is not None else None,
-            lowcoder_hidden_states=lowcoder_outputs.hidden_states if lowcoder_outputs is not None else None,
-            lowcoder_attentions=lowcoder_outputs.attentions if lowcoder_outputs is not None else None,
-            retriever_output=retriever_output,
-            retriever_input=retriever_input,
-        )
-
-
-# from transformers.modeling_flax_utils import
 from transformers.generation.logits_process import LogitsProcessorList
 
 from transformers.modeling_utils import PreTrainedModel
@@ -1995,54 +1838,13 @@ class RPTPreTrainedModel(PreTrainedModel):
 
     base_model_prefix = "transformer"
     config_class = RPTConfig
-    module_class: nn.Module = None
 
     def __init__(self, config: RPTConfig, input_shape=None, device=None, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
-        self.module = self.module_class(config=config, device=device, **kwargs)
         self.input_shape = input_shape
 
     def init_weights(self):
         pass
-
-    def forward(
-            self,
-            input_ids,
-            attention_mask=None,
-            params: dict = None,
-            past_key_values: dict = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            encoded_neighbors: Optional[EncodedNeighbors] = None,
-
-    ):
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        return_dict = return_dict if return_dict is not None else self.config.return_dict
-
-        if attention_mask is not None:
-            attention_mask = torch.Tensor(attention_mask).type(dtype=torch.int)
-
-        outputs = self.module(
-            input_ids=torch.Tensor(input_ids).type(torch.int),
-            past_key_values=past_key_values,
-            attention_mask=attention_mask,
-            encoded_neighbors=encoded_neighbors,
-            deterministic=True,
-            retriever_supervision=None,
-            train_step=None,
-            init_cache=True, # TODO: FALSE!!!
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
-
-        # TODO: Caching
-
-        return outputs
 
     def preret_forward(
             self,
@@ -2055,7 +1857,7 @@ class RPTPreTrainedModel(PreTrainedModel):
 
         apply_kwargs = self.create_apply_kwargs(params)
 
-        outputs = self.module._encode_forward(
+        outputs = self._encode_forward(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             deterministic=not train,
@@ -2117,19 +1919,7 @@ class RPTPreTrainedModel(PreTrainedModel):
     def create_apply_kwargs(self, params, past_key_values=None):
         return {}
 
-    # TODO: Cringe
-    def pad_to_closest_multiple_of_k(self, arr, k):
-        length = arr.size(1)
-        remainder = length % k
-        if remainder == 0:
-            return arr
-        else:
-            pad_length = k - remainder
-            padding = torch.zeros(pad_length, dtype=arr.dtype, device=arr.device)
-            padded_arr = torch.cat((padding.unsqueeze(0), arr), dim=1)
-            return padded_arr
-
-    def sample(
+    def _sample(
         self,
         input_ids: torch.LongTensor,
         logits_processor: Optional[LogitsProcessorList] = None,
@@ -2146,7 +1936,8 @@ class RPTPreTrainedModel(PreTrainedModel):
         synced_gpus: bool = False,
         streamer: Optional["BaseStreamer"] = None,
         **model_kwargs,
-    ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
+    ) -> Union[tuple[GenerateEncoderDecoderOutput, Any], tuple[GenerateDecoderOnlyOutput, Any], tuple[
+        Union[Tensor, LongTensor], Any]]:
         # init values
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
@@ -2285,7 +2076,7 @@ class RPTPreTrainedModel(PreTrainedModel):
         if streamer is not None:
             streamer.end()
 
-        last_lowcoder_states = self.module.transformer.cached_array
+        last_lowcoder_states = self.transformer.cached_array
 
         encoded_lowcoder_states = self.preret_forward(
             hidden_states=last_lowcoder_states,
@@ -2319,10 +2110,166 @@ class RPTPreTrainedModel(PreTrainedModel):
 
 
 class RPTModel(RPTPreTrainedModel):
-    module_class = RPTModule
+
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None):
+        super().__init__(config)
+        #self.dtype = dtype # TODO: Why?
+        # the embedding dim
+        self.embed_dim = self.config.hidden_size
+
+        # TODO: Comon size
+        self.cached_array = torch.zeros(size=(1, config.chunk_size, config.hidden_size), dtype=self.dtype)
+
+        # TODO: move this wte and dropout into the lowcoder.
+
+        # define a dropout layer
+        self.dropout = nn.Dropout(p=self.config.embd_pdrop)
+
+        # TODO: handle init
+        # word to embedding module (layer)
+        self.wte = nn.Embedding(
+            self.config.vocab_size,  # input size
+            self.config.hidden_size,  # embedding size
+            dtype=self.dtype
+        )
+
+        self.lowcoder = RPTLowcoder(self.config, dtype=self.dtype, device=device)
+        if self.config.cca_freq is not None and self.config.cca_freq > 0:
+            self.retriever = RPTRetriever(self.config, dtype=self.dtype)
+        else:
+            self.retriever = None
+
+        self.upcoder = RPTUpcoder(self.config, dtype=self.dtype, device=device)
+
+        # TODO: move this ln_f into the upcoder.
+        self.ln_f = RPTRMSNorm(self.config, dtype=self.dtype)
+
+    # TODO: Verify correctness
+    def _concatenate_to_lowcoder_cache(self, array):
+        *batch_dims, _, hidden_dim = array.shape
+        chunk_size = self.config.chunk_size
+
+        last_chunk = array[..., -chunk_size:, :]
+
+        num_updated_cache_vectors = last_chunk.shape[-2]
+        shift = self.config.chunk_size - num_updated_cache_vectors  # will need to update if I change retrieval stride
+        indices = tuple([slice(None)] * len(batch_dims)) + (slice(shift, None), slice(None))
+
+        self.cached_array = torch.roll(self.cached_array, shifts=-num_updated_cache_vectors, dims=-2)
+        self.cached_array[indices] = last_chunk
+
+    def forward(
+            self,
+            input_ids,
+            past_key_values,
+            attention_mask,
+            position_ids,
+            deterministic=True,
+            retriever_supervision: RetrieverSupervision = None,
+            train_step: Optional[int] = None,
+            init_cache: bool = False,
+            output_attentions: bool = False,
+            output_hidden_states: bool = False,
+            return_dict: bool = True,
+            upcoder_input=None,
+            encoded_neighbors: Optional[EncodedNeighbors] = None,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+
+        if attention_mask is not None:
+            attention_mask = torch.Tensor(attention_mask).type(dtype=torch.int)
+
+        lowcoder_outputs = None
+        retriever_output = None
+        neighbor_hidden_states = None
+        neighbor_mask = None
+        chunk_index = None
+        retriever_input = None
+
+        if upcoder_input is None:
+
+            input_embeds = self.wte(input_ids)
+
+            # TODO: Determinsitc
+            hidden_states = self.dropout(input_embeds)
+
+            lowcoder_outputs = self.lowcoder(
+                hidden_states,
+                past_key_values['lowcoder'],
+                attention_mask,
+                position_ids=position_ids,
+                deterministic=deterministic,
+                init_cache=init_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+
+            hidden_states = lowcoder_outputs.last_hidden_state if return_dict else lowcoder_outputs[0]
+            self._concatenate_to_lowcoder_cache(hidden_states)
+
+            retriever_input = hidden_states
+            if self.retriever is not None:
+                if encoded_neighbors is not None:
+                    neighbor_hidden_states = encoded_neighbors.neighbor_hidden_states
+                    neighbor_mask = encoded_neighbors.neighbor_mask
+                    chunk_index = encoded_neighbors.chunk_index
+                else:
+                    retriever_output = self.retriever(hidden_states=retriever_input,
+                                                      attention_mask=attention_mask,
+                                                      retriever_supervision=retriever_supervision,
+                                                      deterministic=deterministic,
+                                                      train_step=train_step)
+                    neighbor_hidden_states = retriever_output.neighbor_hidden_states
+                    neighbor_mask = retriever_output.neighbor_mask
+        else:
+            hidden_states = upcoder_input.hidden_states
+            attention_mask = upcoder_input.attention_mask
+            neighbor_hidden_states = upcoder_input.neighbor_hidden_states
+            neighbor_mask = upcoder_input.neighbor_mask
+
+        upcoder_outputs = self.upcoder(
+            hidden_states,
+            past_key_values,
+            attention_mask,
+            position_ids=position_ids,
+            neighbor_hidden_states=torch.Tensor(neighbor_hidden_states),
+            neighbor_mask=torch.Tensor(neighbor_mask),
+            chunk_index=chunk_index,
+            deterministic=deterministic,
+            init_cache=init_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = upcoder_outputs.last_hidden_state if return_dict else upcoder_outputs[0]
+        hidden_states = self.ln_f(hidden_states)
+
+        past_key_values = {**lowcoder_outputs.past_key_values, **upcoder_outputs.past_key_values}
+
+        if not return_dict:
+            return (hidden_states,) + upcoder_outputs + lowcoder_outputs, past_key_values  # TODO: Cringe
+
+        return RPTModelOutput(
+            past_key_values=past_key_values,
+            last_hidden_state=upcoder_outputs.last_hidden_state,
+            upcoder_hidden_states=upcoder_outputs.hidden_states,
+            upcoder_attentions=upcoder_outputs.attentions,
+            cross_attentions=None,
+            lowcoder_last_hidden_state=lowcoder_outputs.last_hidden_state if lowcoder_outputs is not None else None,
+            lowcoder_hidden_states=lowcoder_outputs.hidden_states if lowcoder_outputs is not None else None,
+            lowcoder_attentions=lowcoder_outputs.attentions if lowcoder_outputs is not None else None,
+            retriever_output=retriever_output,
+            retriever_input=retriever_input,
+        )
 
 
-class RPTForCausalLMModule(nn.Module):
+class RPTForCausalLMModule(RPTPreTrainedModel):
     config: RPTConfig
     dtype: torch.dtype = torch.float32
     param_dtype: torch.dtype = torch.float32
@@ -2347,8 +2294,8 @@ class RPTForCausalLMModule(nn.Module):
         )
 
         outputs = self.transformer.retriever.preret_encode(
-            hidden_states=torch.Tensor(lowcoder_outputs.last_hidden_state),
-            attention_mask=torch.Tensor(attention_mask),
+            hidden_states=lowcoder_outputs.last_hidden_state,
+            attention_mask=attention_mask,
             **kwargs
         )
 
@@ -2367,10 +2314,10 @@ class RPTForCausalLMModule(nn.Module):
         )
 
     def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__(config, dtype, *args, **kwargs)
         self.config = config
         self.dtype = dtype
-        self.transformer = RPTModule(self.config, dtype=self.dtype, device=device)
+        self.transformer = RPTModel(self.config, dtype=self.dtype, device=device)
         # TODO: initialize
         self.lm_head = nn.Linear(
             in_features=self.config.hidden_size,
@@ -2415,6 +2362,7 @@ class RPTForCausalLMModule(nn.Module):
         if retriever_supervision is not None:
             transformer_input.update(retriever_supervision=retriever_supervision)
 
+        # TODO: Useless
         def transformer(**kwargs):
             return self.transformer(
                 **kwargs,
@@ -2461,8 +2409,7 @@ class RPTForCausalLMModule(nn.Module):
 
 
 
-class RPTForCausalLM(RPTPreTrainedModel):
-    module_class = RPTForCausalLMModule
+class RPTForCausalLM(RPTForCausalLMModule):
     def prepare_inputs_for_generation(self, input_ids,
                                       max_length=None,
                                       attention_mask=None,
