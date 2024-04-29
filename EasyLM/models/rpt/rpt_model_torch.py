@@ -618,13 +618,7 @@ class RPTAttention(nn.Module):
         n_windows = self.config.n_windows
         # stride = self.config.stride if not disable_cache else None
 
-        #jax.debug.print('hidden_states={x}', x=hidden_states)
-
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
-
-        #jax.debug.print('xq={x}', x=xq)
-        #jax.debug.print('xk={x}', x=xk)
-        #jax.debug.print('xv={x}', x=xv)
 
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
@@ -634,15 +628,10 @@ class RPTAttention(nn.Module):
         batch_size = hidden_states.shape[0]
         query_attention_mask = attention_mask
 
-        #jax.debug.print('A: attention_mask={x}',x=attention_mask)
-
         presets = None
         if True: # TODO: Make this more subtle like the original :) #if (layer_past is not None or init_cache) and not disable_cache:
             xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask, layer_past)
             presets = ({'xk': xk, 'xv': xv, 'cache_mask': attention_mask},)
-
-        #jax.debug.print('B: attention_mask={x}',x=attention_mask)
-
 
         key_length = xk.shape[-3]
 
@@ -656,12 +645,8 @@ class RPTAttention(nn.Module):
                 torch.clip(torch.cumsum(attention_mask, dim=-1) - 1, min=0),
                 (batch_size, key_length)
             ).type(torch.int)
-            #jax.debug.print('cumsum={x}', x=attention_mask)
-            #jax.debug.print('position_ids_k={position_ids_k}', position_ids_k=position_ids_k)
             freqs_cis_k = self.freqs_cis[position_ids_k]
-            #jax.debug.print('freqs_cis_k={freqs_cis_k}', freqs_cis_k=freqs_cis_k)
             position_ids += position_ids_k.max() - position_ids.max()
-            #jax.debug.print('position_ids={position_ids}', position_ids=position_ids)
         else:
             position_ids_k = position_ids
             freqs_cis_k = None
@@ -692,8 +677,6 @@ class RPTAttention(nn.Module):
                                   freqs_cis_k=freqs_cis_k,
                                   dtype=self.dtype, rot_dim=self.config.rot_dim)
 
-
-        #jax.debug.print('xq_rot={xq}\nxk_rot={xk}', xq=xq, xk=xk)
 
         # transform boolean mask into float mask
         attention_bias = torch.full(attention_mask.shape, torch.finfo(self.dtype).min).type(self.dtype)
@@ -772,10 +755,6 @@ class RPTAttention(nn.Module):
             attn_weights = torch.Tensor(attn_weights.tolist())
             """
 
-            #jax.debug.print('attn_input_mask: {x}', x=attention_mask)
-            #jax.debug.print('attn_input: xq_rot_null={xq}\nxk_rot_null={xk}', xq=xq,   xk=xk)
-            #jax.debug.print('bias={x}', x=attention_bias)
-
             # TODO: Handle dropout
             attn_weights = dot_product_attention_weights(
                 xq,
@@ -785,8 +764,6 @@ class RPTAttention(nn.Module):
                 deterministic=deterministic,
                 dtype=self.dtype,
             )
-
-            #jax.debug.print('attn_weights={attn_weights}', attn_weights=attn_weights)
 
             print(f"{attn_weights.shape=}")
             attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv)
@@ -2076,8 +2053,6 @@ class RPTPreTrainedModel(PreTrainedModel):
             next_token = jax.random.categorical(prng_key, jnp.array(next_token_scores.detach().numpy()), axis=-1)
             next_tokens = torch.Tensor(next_token.tolist()).type(torch.int)
 
-            jax.debug.print('next_token={x}', x=next_token)
-
             # finished sentences should have their next token be a padding token
             if eos_token_id is not None:
                 if pad_token_id is None:
@@ -2432,7 +2407,6 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
         )
 
     def unembed(self, hidden_states):
-        ##jax.debug.print('unembed input={x}', x=hidden_states)
         if self.config.tie_word_embeddings:
             lm_logits = torch.Tensor(hidden_states[0] @ self.transformer.wte.weight.T).unsqueeze(0)
         else:
@@ -2440,8 +2414,6 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
 
         if self.config.palm_init:
             lm_logits = lm_logits / hidden_states.shape[-1]**0.5
-
-        jax.debug.print('lm_logits={x}', x=lm_logits)
 
         return lm_logits
 
