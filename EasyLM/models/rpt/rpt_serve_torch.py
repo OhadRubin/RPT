@@ -217,10 +217,24 @@ def postproc_output(tokenizer, output, output_text, verbose=False):
     return new_output_text
 
 
+def softmax_cross_entropy_with_integer_labels(logits, labels):
+    # TODO: return asserts
+    #chex.assert_type([logits], float)
+    #chex.assert_type([labels], int)
+
+    # This is like jnp.take_along_axis(jax.nn.log_softmax(...), ...) except that
+    # we avoid subtracting the normalizer from all values, just from the values
+    # for the correct labels.
+    logits_max = torch.max(logits, dim=-1, keepdim=True)
+    label_logits = torch.take_along_dim(logits, labels[..., None], dim=-1)[..., 0]
+    log_normalizers = torch.log(torch.sum(torch.exp(logits), dim=-1))
+    return log_normalizers - label_logits
+
 def process_logits(output_tokens, output_mask, logits):
-    loglikelihood = -optax.softmax_cross_entropy_with_integer_labels(
-        logits, output_tokens
-    )
+    # TODO: Remove after testing
+    loglikelihood = -optax.softmax_cross_entropy_with_integer_labels(logits, output_tokens)
+    loglikelihood = -softmax_cross_entropy_with_integer_labels(logits, output_tokens)
+
     loglikelihood = torch.sum(loglikelihood * output_mask, dim=-1)
     match_count = torch.sum(
         (torch.argmax(logits, dim=-1) == output_tokens) * output_mask,
@@ -312,21 +326,8 @@ def main(argv):
     hf_model = RPTForCausalLM(rpt_config, device=device)
     hf_model.to(device)
 
-
-    # TODO: Cringe
-    gin.clear_config()
-
-    from transformers.modeling_flax_pytorch_utils import load_flax_weights_in_pytorch_model
-
-    for key_to_modify in ['lowcoder', 'upcoder']:
-        layers = params['params']['transformer'][key_to_modify]['layers']
-        del params['params']['transformer'][key_to_modify]['layers']
-        params['params']['transformer'][key_to_modify]['layers'] = {'blocks': layers }
-
-    load_flax_weights_in_pytorch_model(hf_model, params['params'])
-
-    hf_model.save_pretrained('rpt-torch-1')
-    hf_model.from_pretrained('rpt-torch-1')
+    #hf_model.save_pretrained('rpt-torch-1')
+    #hf_model.from_pretrained('rpt-torch-1')
 
     _forward_upcoder = apply_forward_upcoder
     _forward_loglikelihood = apply_forward_loglikelihood

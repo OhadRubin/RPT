@@ -1919,7 +1919,7 @@ class RPTPreTrainedModel(PreTrainedModel):
     def create_apply_kwargs(self, params, past_key_values=None):
         return {}
 
-    def _sample(
+    def sample(
         self,
         input_ids: torch.LongTensor,
         logits_processor: Optional[LogitsProcessorList] = None,
