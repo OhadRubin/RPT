@@ -326,8 +326,17 @@ def main(argv):
     hf_model = RPTForCausalLM(rpt_config, device=device)
     hf_model.to(device)
 
-    #hf_model.save_pretrained('rpt-torch-1')
-    #hf_model.from_pretrained('rpt-torch-1')
+    from transformers.modeling_flax_pytorch_utils import load_flax_weights_in_pytorch_model
+
+    for key_to_modify in ['lowcoder', 'upcoder']:
+        layers = params['params']['transformer'][key_to_modify]['layers']
+        del params['params']['transformer'][key_to_modify]['layers']
+        params['params']['transformer'][key_to_modify]['layers'] = {'blocks': layers }
+
+    load_flax_weights_in_pytorch_model(hf_model, params['params'])
+
+    hf_model.save_pretrained('rpt-torch-1')
+    hf_model.from_pretrained('rpt-torch-1')
 
     _forward_upcoder = apply_forward_upcoder
     _forward_loglikelihood = apply_forward_loglikelihood
