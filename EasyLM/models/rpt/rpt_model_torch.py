@@ -1987,11 +1987,6 @@ class RPTPreTrainedModel(PreTrainedModel):
         # keep track of which sequences are already finished
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
-        # TODO: Remove. Used for debugging and reproduction purposes.
-        import jax
-        import jax.numpy as jnp
-        prng_key = jax.random.PRNGKey(0) # prng_key if prng_key is not None else jax.random.PRNGKey(0)
-
         this_peer_finished = False  # used by synced_gpus only
         # auto-regressive generation
         while True:
@@ -2049,9 +2044,6 @@ class RPTPreTrainedModel(PreTrainedModel):
             # sample
             probs = nn.functional.softmax(next_token_scores, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            prng_key, prng_key_next = jax.random.split(prng_key)
-            next_token = jax.random.categorical(prng_key, jnp.array(next_token_scores.detach().numpy()), axis=-1)
-            next_tokens = torch.Tensor(next_token.tolist()).type(torch.int)
 
             # finished sentences should have their next token be a padding token
             if eos_token_id is not None:
