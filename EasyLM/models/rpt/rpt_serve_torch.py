@@ -81,14 +81,17 @@ def apply_forward_upcoder(hf_model,
                           input_mask,
                           output_tokens,
                           output_mask,
-                          upcoder_input
+                          upcoder_input,
+                          past_key_values
                           ):
-    outputs, past_key_values = hf_model(input_tokens, attention_mask=input_mask,
+    outputs = hf_model(
+        torch.Tensor(input_tokens).type(torch.int),
+        attention_mask=torch.Tensor(input_mask).type(torch.int),
         upcoder_input=upcoder_input,
         deterministic=True,
-        mutable=['cache', 'intermediates']
+        past_key_values=past_key_values,
     )
-    output = process_logits(output_tokens, output_mask, outputs.logits)
+    output = process_logits(torch.Tensor(output_tokens).type(torch.int), torch.Tensor(output_mask).type(torch.int), outputs.logits)
     #past_key_values = unfreeze(past_key_values).get("cache", None)
     return output, past_key_values
 
@@ -108,13 +111,14 @@ def apply_forward_loglikelihood(hf_model,
     return output, past_key_values
 
 
-def apply_forward_lowcoder(hf_model, input_tokens, input_mask, **kwargs):
+def apply_forward_lowcoder(hf_model, input_tokens, input_mask, past_key_value, **kwargs):
     # TODO: Apply and other parameters
     # TODO: Output attention
     outputs, past_key_values = hf_model._lowcoder_forward(
-        input_ids=input_tokens,
-        attention_mask=input_mask,
+        input_ids=torch.Tensor(input_tokens).type(torch.int),
+        attention_mask=torch.Tensor(input_mask).type(torch.int),
         deterministic=True,
+        past_key_value=past_key_value,
         **kwargs,
     )
 
@@ -146,12 +150,13 @@ def _loglikelihood_rolling(tokenizer, hf_model, text, func, nearest_chunk_distan
     total_is_greedy = True
     metadata_list = tuple()
     token_count = np.zeros((len(text),), dtype=np.int32)
+    past_key_value = None
 
     for batch in rolling_iterator(tokenizer, text, input_length):
         token_count += batch['output_mask'].sum(-1)
 
-        (loglikelihood, is_greedy), metadata = func(
-            hf_model, batch, memory
+        (loglikelihood, is_greedy), metadata, past_key_value = func(
+            hf_model, batch, memory, past_key_value,
         )
         metadata_list += (metadata,)
         total_loglikelihood += loglikelihood
@@ -164,18 +169,22 @@ def _loglikelihood_rolling(tokenizer, hf_model, text, func, nearest_chunk_distan
 
 def create_forward_loglikelihood(config, low_fwd, up_fwd, fwd):
     def forward_loglikelihood_no_mem(params, batch, memory):
-        outputs, past_key_values = fwd(params, batch)
+        outputs, past_key_values = fwd(params, *batch)
         return outputs, past_key_values
 
-    def forward_loglikelihood_w_mem(params, batch, memory):
-        outputs, past_key_values = low_fwd(params, batch)
-        params.update(cache=past_key_values)
+    def forward_loglikelihood_w_mem(params, batch, memory, past_key_values):
+        outputs, new_past_key_values = low_fwd(params, batch['input_tokens'], batch['input_mask'], past_key_values)
+        if past_key_values is not None:
+            past_key_values = {**past_key_values, **new_past_key_values}
+        else:
+            past_key_values = new_past_key_values
+
 
         neighbor_hidden_states, neighbor_mask, metadata, *_ = memory.add(
             input_tokens=batch["input_tokens"],
-            encoded_hidden_states=outputs.encoded_hidden_states,
-            key_chunks=outputs.key_chunks,
-            query_chunks=outputs.query_chunks,
+            encoded_hidden_states=outputs.encoded_hidden_states.detach().numpy(),
+            key_chunks=outputs.key_chunks.detach().numpy(),
+            query_chunks=outputs.query_chunks.detach().numpy(),
         )
         batch.update(
             upcoder_input=RPTLowcoderRetrieverEncodedOutput(
@@ -185,9 +194,8 @@ def create_forward_loglikelihood(config, low_fwd, up_fwd, fwd):
                 neighbor_mask=neighbor_mask
             )
         )
-        outputs, past_key_values = up_fwd(params, batch)
-        params.update(cache=past_key_values)
-        return outputs, metadata
+        outputs, past_key_values = up_fwd(params, batch['input_tokens'], batch['input_mask'], batch['output_tokens'], batch['output_mask'], batch['upcoder_input'], past_key_values)
+        return outputs, metadata, past_key_values
 
     if config.cca_freq == 0:
         return forward_loglikelihood_no_mem
@@ -225,16 +233,20 @@ def softmax_cross_entropy_with_integer_labels(logits, labels):
     # This is like jnp.take_along_axis(jax.nn.log_softmax(...), ...) except that
     # we avoid subtracting the normalizer from all values, just from the values
     # for the correct labels.
-    logits_max = torch.max(logits, dim=-1, keepdim=True)
-    label_logits = torch.take_along_dim(logits, labels[..., None], dim=-1)[..., 0]
+    logits = torch.max(logits, dim=-1, keepdim=True).values
+    label_logits = torch.take_along_dim(logits, labels[..., None].type(torch.long), dim=-1)[..., 0]
     log_normalizers = torch.log(torch.sum(torch.exp(logits), dim=-1))
     return log_normalizers - label_logits
 
 def process_logits(output_tokens, output_mask, logits):
+    import jax.numpy as jnp
+    import jax
     # TODO: Remove after testing
-    loglikelihood = -optax.softmax_cross_entropy_with_integer_labels(logits, output_tokens)
-    loglikelihood = -softmax_cross_entropy_with_integer_labels(logits, output_tokens)
-
+    jax.debug.print('output_tokens={output_tokens}', output_tokens=output_tokens)
+    jax.debug.print('logits={logits}', logits=logits)
+    loglikelihood = -optax.softmax_cross_entropy_with_integer_labels(jnp.array(logits.detach().numpy()), jnp.array(output_tokens.detach().numpy()))
+    #loglikelihood = -softmax_cross_entropy_with_integer_labels(logits, output_tokens)
+    loglikelihood = torch.Tensor(loglikelihood.tolist())
     loglikelihood = torch.sum(loglikelihood * output_mask, dim=-1)
     match_count = torch.sum(
         (torch.argmax(logits, dim=-1) == output_tokens) * output_mask,

@@ -1841,7 +1841,7 @@ class RPTPreTrainedModel(PreTrainedModel):
     base_model_prefix = "transformer"
     config_class = RPTConfig
 
-    def __init__(self, config: RPTConfig, input_shape=None, device=None, *inputs, **kwargs):
+    def __init__(self, config: RPTConfig, dtype=torch.float32, input_shape=None, device=None, *inputs, **kwargs):
         super().__init__(config, *inputs, **kwargs)
         self.input_shape = input_shape
 
@@ -2253,7 +2253,10 @@ class RPTModel(RPTPreTrainedModel):
         hidden_states = upcoder_outputs.last_hidden_state if return_dict else upcoder_outputs[0]
         hidden_states = self.ln_f(hidden_states)
 
-        past_key_values = {**lowcoder_outputs.past_key_values, **upcoder_outputs.past_key_values}
+        if lowcoder_outputs is not None:
+            past_key_values = {**lowcoder_outputs.past_key_values, **upcoder_outputs.past_key_values}
+        else:
+            past_key_values = upcoder_outputs.past_key_values
 
         if not return_dict:
             return (hidden_states,) + upcoder_outputs + lowcoder_outputs, past_key_values  # TODO: Cringe
@@ -2284,13 +2287,13 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
             **kwargs
         )
 
-    def _lowcoder_forward(self, input_ids, attention_mask, **kwargs):
+    def _lowcoder_forward(self, input_ids, attention_mask, past_key_value, **kwargs):
         """
 
         """
         lowcoder_outputs = self.transformer.lowcoder(
             self.transformer.wte(input_ids),
-            None,
+            past_key_value,
             attention_mask,
             init_cache=True,
             **kwargs
