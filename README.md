@@ -1,3 +1,8 @@
+# Retrieval-Pretrained Transformer: Long-range Language Modeling with Self-retrieval
+This repository contains the code for the RPT model. It is based on the EasyLM library.
+
+Below is the original readme.
+
 # EasyLM
 Large language models (LLMs) made easy, EasyLM is a one stop solution for
 pre-training, finetuning, evaluating and serving LLMs in JAX/Flax. EasyLM can
