@@ -10,7 +10,6 @@ if "DEBUG" in os.environ:
     debugpy.wait_for_client()
 
 import mlxu
-import optax
 from transformers import GenerationConfig
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.serving import LMServer
@@ -92,7 +91,6 @@ def apply_forward_upcoder(hf_model,
         past_key_values=past_key_values,
     )
     output = process_logits(torch.Tensor(output_tokens).type(torch.int), torch.Tensor(output_mask).type(torch.int), outputs.logits)
-    #past_key_values = unfreeze(past_key_values).get("cache", None)
     return output, past_key_values
 
 
@@ -106,14 +104,11 @@ def apply_forward_loglikelihood(hf_model,
         input_tokens, attention_mask=input_mask, deterministic=True
     )
     output = process_logits(output_tokens, output_mask, outputs.logits)
-    #past_key_values = unfreeze(past_key_values).get("cache", None)
 
     return output, past_key_values
 
 
-def apply_forward_lowcoder(hf_model, input_tokens, input_mask, past_key_value, **kwargs):
-    # TODO: Apply and other parameters
-    # TODO: Output attention
+def apply_forward_lowcoder(hf_model, input_tokens, input_mask, past_key_value=None, **kwargs):
     outputs, past_key_values = hf_model._lowcoder_forward(
         input_ids=torch.Tensor(input_tokens).type(torch.int),
         attention_mask=torch.Tensor(input_mask).type(torch.int),
@@ -132,7 +127,7 @@ def apply_forward_augment(hf_model, hidden_states, neighbor_hidden_states, neigh
         neighbor_mask=neighbor_mask,
         deterministic=True,
         layer_past=past_key_values['augment'],
-        init_cache=True, # TODO: Really??
+        init_cache=True,
     )
     #past_key_values = unfreeze(past_key_values).get("cache", None)
     return outputs, {'augment': past_key_values}
@@ -142,8 +137,6 @@ def _loglikelihood_rolling(tokenizer, hf_model, text, func, nearest_chunk_distan
                            verbose=True, return_scores=False):
     memory = Memory(chunk_size=64, num_neighbors=num_neighbors, nearest_chunk_distance=nearest_chunk_distance,
                     return_scores=return_scores)
-    #params.update(cache=jax.tree_map(lambda x: jnp.zeros_like(x), params['cache']))
-    # TODO: cache intitialization
 
     loglikelihood_list = []
     total_loglikelihood = 0.0
@@ -226,10 +219,6 @@ def postproc_output(tokenizer, output, output_text, verbose=False):
 
 
 def softmax_cross_entropy_with_integer_labels(logits, labels):
-    # TODO: return asserts
-    #chex.assert_type([logits], float)
-    #chex.assert_type([labels], int)
-
     # This is like jnp.take_along_axis(jax.nn.log_softmax(...), ...) except that
     # we avoid subtracting the normalizer from all values, just from the values
     # for the correct labels.
@@ -239,14 +228,7 @@ def softmax_cross_entropy_with_integer_labels(logits, labels):
     return log_normalizers - label_logits
 
 def process_logits(output_tokens, output_mask, logits):
-    import jax.numpy as jnp
-    import jax
-    # TODO: Remove after testing
-    jax.debug.print('output_tokens={output_tokens}', output_tokens=output_tokens)
-    jax.debug.print('logits={logits}', logits=logits)
-    loglikelihood = -optax.softmax_cross_entropy_with_integer_labels(jnp.array(logits.detach().numpy()), jnp.array(output_tokens.detach().numpy()))
-    #loglikelihood = -softmax_cross_entropy_with_integer_labels(logits, output_tokens)
-    loglikelihood = torch.Tensor(loglikelihood.tolist())
+    loglikelihood = -softmax_cross_entropy_with_integer_labels(logits, output_tokens)
     loglikelihood = torch.sum(loglikelihood * output_mask, dim=-1)
     match_count = torch.sum(
         (torch.argmax(logits, dim=-1) == output_tokens) * output_mask,
@@ -317,7 +299,6 @@ def rolling_iterator(tokenizer, text, input_length):
 
 def main(argv):
     gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
-    #jax.distributed.initialize()
 
     prefix_tokenizer = RPTConfig.get_tokenizer(truncation_side='left', padding_side='left')
     tokenizer = RPTConfig.get_tokenizer(truncation_side='right', padding_side='right')
@@ -335,21 +316,6 @@ def main(argv):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    #hf_model = RPTForCausalLM(rpt_config, device=device)
-    #hf_model.to(device)
-
-    """
-    from transformers.modeling_flax_pytorch_utils import load_flax_weights_in_pytorch_model
-
-    for key_to_modify in ['lowcoder', 'upcoder']:
-        layers = params['params']['transformer'][key_to_modify]['layers']
-        del params['params']['transformer'][key_to_modify]['layers']
-        params['params']['transformer'][key_to_modify]['layers'] = {'blocks': layers }
-
-    load_flax_weights_in_pytorch_model(hf_model, params['params'])
-
-    hf_model.save_pretrained('rpt-torch-1')
-    """
     hf_model = RPTForCausalLM.from_pretrained('rpt-torch-1')
 
     _forward_upcoder = apply_forward_upcoder
@@ -470,7 +436,6 @@ def main(argv):
             batch = prepare_prefix(prefix_tokenizer, text, FLAGS.input_length, FLAGS.add_bos_token, device)
             # TOOD: investigate this:
             # Flax RPT Retriver Encoded output
-            # TODO: init_cache bruh
             outputs, past_key_values = _forward_lowcoder(hf_model, **batch)
             neighbor_hidden_states, neighbor_mask, *_ = memory.add(
                 input_tokens=batch["input_tokens"],
@@ -484,7 +449,6 @@ def main(argv):
 
             output_text = [tuple() for _ in range(batch_size)]
 
-            #params.pop("cache")
             output = None
             for turn_index in range(n_turns + 1):
                 if turn_index == 0:  # first iteration
@@ -502,7 +466,6 @@ def main(argv):
                         neighbor_hidden_states = np.concatenate([prompt_vector, neighbor_hidden_states], axis=1)
                         neighbor_mask = np.concatenate([prompt_mask, neighbor_mask], axis=1)
 
-                    # TODO: Missing parameters
                     neighbor_hidden_states, new_past_key_values = _forward_augment(
                         hf_model,
                         hidden_states=enc_lowcoder_states.original_hidden_states,
@@ -511,7 +474,6 @@ def main(argv):
                         past_key_values=past_key_values,
                     )
                     past_key_values = {**past_key_values, **new_past_key_values}
-                    #params.update(cache=past_key_values)
 
                     latest_token = output[:, -1:]
                     batch.update(input_tokens=latest_token,
@@ -528,7 +490,6 @@ def main(argv):
                     )
                 )
                 output, new_past_key_values, enc_lowcoder_states = forward_generate(batch, max_new_tokens, temperature, past_key_values=past_key_values)
-                #params.update(cache=past_key_values)
                 if past_key_values is not None:
                     past_key_values = {**past_key_values, **new_past_key_values}
                 else:

@@ -14,17 +14,15 @@ from ml_collections import ConfigDict
 from typing import Optional, Tuple, Union, Dict, List, Any
 from transformers import AutoTokenizer, StoppingCriteriaList
 from einops import rearrange
-from transformers.generation import validate_stopping_criteria, GenerateEncoderDecoderOutput, GenerateDecoderOnlyOutput
+from transformers.generation import validate_stopping_criteria
 from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPastAndCrossAttentions
-from transformers.generation.utils import GenerateNonBeamOutput, GenerateDecoderOnlyOutput, GenerateEncoderDecoderOutput
+from transformers.generation.utils import GenerateDecoderOnlyOutput, GenerateEncoderDecoderOutput
 
 from EasyLM.torch_utils import make_attention_mask, make_causal_mask, combine_masks, gelu, silu, assign_slice
 from dataclasses import dataclass
 
 # used just for the attention function call
 from EasyLM.torch_attn import dot_product_attention_weights
-
-import jax
 
 
 RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])
@@ -527,9 +525,6 @@ class RPTAttention(nn.Module):
             device=device,
         )
         if self.config.add_null_attn:
-            #self.null_k = self.param(f'null_k', nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
-            #self.null_v = self.param(f'null_v', nn.init.normal(0.0001), (1, 1, self.num_heads, self.head_dim))
-
             self.null_k = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
             self.null_v = nn.Parameter(torch.normal(mean=0, std=0.0001, size=(1, 1, self.num_heads, self.head_dim)))
 
@@ -540,9 +535,7 @@ class RPTAttention(nn.Module):
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
 
     def _concatenate_to_cache(self, key, value, query, attention_mask, layer_past):
-        is_initialized = layer_past is not None
-
-        if not is_initialized:
+        if layer_past is None:
             key_max_shape = list(key.shape)
             value_max_shape = list(value.shape)
             query_max_shape = list(query.shape)
@@ -563,43 +556,34 @@ class RPTAttention(nn.Module):
         cache_mask = layer_past[0]['cache_mask'] if layer_past is not None and 'cache_mask' in layer_past[0] else torch.zeros(attention_mask.shape, dtype=key.dtype, device=self.device)
 
         # detect if we're initializing by absence of existing cache data.
-        is_initialized = past_key is not None
         cached_key = past_key
         cached_value = past_value
 
-        # TODO: Always is bruh
-        if is_initialized:
-            *batch_dims, max_length, num_heads, depth_per_head = cached_key.shape
-            # update key, value caches with our new 1d spatial slices
-            num_updated_cache_vectors = query.shape[-3]
-            shift = max_length - num_updated_cache_vectors
+        *batch_dims, max_length, num_heads, depth_per_head = cached_key.shape
+        # update key, value caches with our new 1d spatial slices
+        num_updated_cache_vectors = query.shape[-3]
+        shift = max_length - num_updated_cache_vectors
 
-            def cur_index_big_torch(key, value, attention_mask):
-                indices = (0,) * len(batch_dims) + (shift, 0, 0)
+        def cur_index_big_torch(key, value, attention_mask):
+            indices = (0,) * len(batch_dims) + (shift, 0, 0)
 
-                key_operand = torch.roll(cached_key, shifts=-num_updated_cache_vectors, dims=-3)
-                key = assign_slice(key_operand, key, indices)
+            key_operand = torch.roll(cached_key, shifts=-num_updated_cache_vectors, dims=-3)
+            key = assign_slice(key_operand, key, indices)
 
-                value_operand = torch.roll(cached_value, shifts=-num_updated_cache_vectors, dims=-3)
-                value = assign_slice(value_operand, value, indices)
+            value_operand = torch.roll(cached_value, shifts=-num_updated_cache_vectors, dims=-3)
+            value = assign_slice(value_operand, value, indices)
 
-                mask_operand = torch.roll(cache_mask, shifts=-num_updated_cache_vectors, dims=-1)
+            mask_operand = torch.roll(cache_mask, shifts=-num_updated_cache_vectors, dims=-1)
 
-                attention_mask = assign_slice(mask_operand, attention_mask.type(mask_operand.dtype), (0,) * len(batch_dims) + (shift,))
+            attention_mask = assign_slice(mask_operand, attention_mask.type(mask_operand.dtype), (0,) * len(batch_dims) + (shift,))
 
-                return key, value, attention_mask
+            return key, value, attention_mask
 
-            # cond_input = (key, value, attention_mask,)
-            # key, value, attention_mask = lax.cond(cur_index < max_length,
-            #                                     cur_index_small,
-            #                                     cur_index_big,
-            #                                     *cond_input)
-            # else:
-            key, value, attention_mask = cur_index_big_torch(key, value, attention_mask)
+        key, value, attention_mask = cur_index_big_torch(key, value, attention_mask)
 
-            cached_key.value = key
-            cached_value.value = value
-            cache_mask.value = attention_mask
+        cached_key.value = key
+        cached_value.value = value
+        cache_mask.value = attention_mask
 
         return key, value, attention_mask
 
@@ -628,10 +612,8 @@ class RPTAttention(nn.Module):
         batch_size = hidden_states.shape[0]
         query_attention_mask = attention_mask
 
-        presets = None
-        if True: # TODO: Make this more subtle like the original :) #if (layer_past is not None or init_cache) and not disable_cache:
-            xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask, layer_past)
-            presets = ({'xk': xk, 'xv': xv, 'cache_mask': attention_mask},)
+        xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask, layer_past)
+        presets = ({'xk': xk, 'xv': xv, 'cache_mask': attention_mask},)
 
         key_length = xk.shape[-3]
 
@@ -686,90 +668,38 @@ class RPTAttention(nn.Module):
             xk = repeat_kv(xk, self.num_key_value_groups)
             xv = repeat_kv(xv, self.num_key_value_groups)
 
-        # TODO: Scan
-        # usual dot product attention
-        if self.config.scan_attention:
-            """
-            attn_weights = None
-            attention_mask = einops.rearrange(
-                combine_masks(attention_mask, fcm_mask),
-                '... s q k -> ... s 1 q k'
-            )
+        if sliding_window and n_windows > 1:
+            xq, xk, xv = map(lambda t: rearrange(t, 'b (s l) ... -> b s l ...', s=n_windows),
+                             (xq, xk, xv))
+            attention_bias = rearrange(attention_bias, '(b s) ... -> b s ...', s=n_windows)
 
-            dropout_rng = None
-            if not deterministic and self.config.attn_pdrop > 0.0:
-                dropout_rng = jax.random.key(0)
+            past_xk, past_xv, past_attention_bias = map(lambda t: t[:, :-1, :, :, :],
+                                                        (xk, xv, attention_bias))
+            past_xk, past_xv = map(lambda t: torch.pad(t, [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)]),
+                                   (past_xk, past_xv))
+            past_attention_bias = torch.pad(past_attention_bias, [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)],
+                                          constant_values=torch.finfo(past_attention_bias.dtype).min)
+            xk = torch.concatenate((past_xk, xk), axis=-3)
+            xv = torch.concatenate((past_xv, xv), axis=-3)
+            attention_bias = torch.concatenate((past_attention_bias, attention_bias), axis=-1)
 
-            attn_output = efficient_dot_product_attention(
-                jnp.array(xq),
-                jnp.array(xk),
-                jnp.array(xv),
-                bias=attention_mask,
-                dropout_rng=dropout_rng,
-                dropout_rate=self.config.attn_pdrop,
-                enable_dropout=not deterministic and self.config.attn_pdrop > 0.0,
-                float32_logits=True,
-                causal_mask=True,
-                precision=self.precision,
-                query_chunk_size=self.config.scan_query_chunk_size,
-                key_chunk_size=self.config.scan_key_chunk_size,
-            )
-            """
-            pass
+        if self.config.add_null_attn:
+            xv, xk, attention_bias = self.concat_null_kv(xv, xk, attention_bias)
 
-        else:
-            if sliding_window and n_windows > 1:
-                xq, xk, xv = map(lambda t: rearrange(t, 'b (s l) ... -> b s l ...', s=n_windows),
-                                 (xq, xk, xv))
-                attention_bias = rearrange(attention_bias, '(b s) ... -> b s ...', s=n_windows)
+        attn_weights = dot_product_attention_weights(
+            xq,
+            xk,
+            bias=attention_bias,
+            dropout_rate=self.config.attn_pdrop,
+            deterministic=deterministic,
+            dtype=self.dtype,
+        )
 
-                past_xk, past_xv, past_attention_bias = map(lambda t: t[:, :-1, :, :, :],
-                                                            (xk, xv, attention_bias))
-                past_xk, past_xv = map(lambda t: torch.pad(t, [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)]),
-                                       (past_xk, past_xv))
-                past_attention_bias = torch.pad(past_attention_bias, [(0, 0), (1, 0), (0, 0), (0, 0), (0, 0)],
-                                              constant_values=torch.finfo(past_attention_bias.dtype).min)
-                xk = torch.concatenate((past_xk, xk), axis=-3)
-                xv = torch.concatenate((past_xv, xv), axis=-3)
-                attention_bias = torch.concatenate((past_attention_bias, attention_bias), axis=-1)
-
-            if self.config.add_null_attn:
-                xv, xk, attention_bias = self.concat_null_kv(xv, xk, attention_bias)
-
-
-            """
-            dropout_rng = None
-            if not deterministic and self.config.attn_pdrop > 0.0:
-                dropout_rng = jax.random.key(0)
-
-            attn_weights = flax_dot_product_attention_weights(
-                jnp.array(xq.detach().numpy()),
-                jnp.array(xk.detach().numpy()),
-                bias=jnp.array(attention_bias.detach().numpy()),
-                dropout_rng=dropout_rng,
-                dropout_rate=self.config.attn_pdrop,
-                deterministic=deterministic,
-                dtype=jnp.float32,
-            )
-            
-            attn_weights = torch.Tensor(attn_weights.tolist())
-            """
-
-            # TODO: Handle dropout
-            attn_weights = dot_product_attention_weights(
-                xq,
-                xk,
-                bias=attention_bias,
-                dropout_rate=self.config.attn_pdrop,
-                deterministic=deterministic,
-                dtype=self.dtype,
-            )
-
-            print(f"{attn_weights.shape=}")
-            attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv)
-            if sliding_window and n_windows > 1:
-                attn_output = rearrange(attn_output,
-                                        'b s l ... -> b (s l) ...', s=n_windows)
+        print(f"{attn_weights.shape=}")
+        attn_output = torch.einsum("...hqk,...khd->...qhd", attn_weights, xv)
+        if sliding_window and n_windows > 1:
+            attn_output = rearrange(attn_output,
+                                    'b s l ... -> b (s l) ...', s=n_windows)
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.wo(attn_output)
@@ -796,17 +726,6 @@ class RPTAttention(nn.Module):
         xv = torch.concatenate((xv, null_v), dim=-3) # torch.Size([1, 1025, 16, 128])
         attention_bias = torch.concatenate((attention_bias, torch.full(tuple(attention_bias_shape), 0.0)), dim=-1) # add last dim (embedding?)
         return xv, xk, attention_bias
-
-
-# TODO: Currently unused!! make sure you use it or get rid of it
-def dense_init(input_tensor, config, is_embedding=False):
-    if config.palm_init:
-        if is_embedding:
-            return nn.init.normal(tensor=input_tensor, std=1.0)
-        # TODO: The use of len needs more examination
-        return nn.init.normal(tensor=input_tensor, std=torch.sqrt(config.initializer_range / len(input_tensor)))
-    else:
-        return nn.init.normal(tensor=input_tensor, std=config.initializer_range)
 
 
 class RPTCrossAttention(nn.Module):
@@ -927,27 +846,6 @@ class RPTCrossAttention(nn.Module):
         else:
             attention_bias = None
 
-
-        """
-        # TODO: Get rid of JAX
-        dropout_rng = None
-        if not deterministic and self.config.attn_pdrop > 0.0:
-            dropout_rng = self.make_rng("dropout")
-
-        attn_weights = flax_dot_product_attention_weights(
-            jnp.array(xq.detach().numpy()),
-            jnp.array(xk.detach().numpy()),
-            bias=None if attention_bias is None else jnp.array(attention_bias.detach().numpy()),
-            dropout_rng=dropout_rng,
-            dropout_rate=self.config.attn_pdrop,
-            deterministic=deterministic,
-            dtype=jnp.float32,
-            precision=None,
-        )
-        
-        attn_weights = torch.Tensor(attn_weights.tolist())
-        """
-
         attn_weights = dot_product_attention_weights(
             xq,
             xk,
@@ -975,7 +873,6 @@ class RPTMLP(nn.Module):
         self.config = config
         self.dtype = dtype
 
-        # TODO: Don't forget to initialize
         self.w1 = nn.Linear(
             in_features=config.hidden_size,
             out_features=config.intermediate_size if config.gated_ff else 4 * config.hidden_size,
@@ -996,7 +893,6 @@ class RPTMLP(nn.Module):
                 bias=False,
             )
 
-        # TODO: Deterministic dropout
         self.dropout = nn.Dropout(p=self.config.resid_pdrop)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1053,7 +949,7 @@ class RPTLowcoderLayer(nn.Module):
             layer_past,
             attention_mask,
             deterministic,
-            init_cache, # TODO: caching and stuff
+            init_cache,
             output_attentions,
             fcm_mask,
             sliding_window=self.config.sliding_window,
@@ -1067,33 +963,7 @@ class RPTLowcoderLayer(nn.Module):
         # nomalize hidden states
         feed_forward_input = self.ffn_norm(hidden_states)
 
-        # TODO: Torch doesn't have a scan yet: https://github.com/pytorch/pytorch/pull/119430
-        # run the nomlaized hidden states into the MLP
-        if self.config.scan_mlp:
-            feed_forward_input = einops.rearrange(
-                feed_forward_input,
-                '... (b s) d -> ... b s d',
-                b=self.config.scan_mlp_chunk_size
-            )
-
-            def mlp_forward(mlp, carry, x):
-                return None, mlp(x, deterministic)
-
-            scan_axis = feed_forward_input.ndim - 3
-
-            _, feed_forward_hidden_states = nn.scan(
-                mlp_forward,
-                variable_broadcast="params",
-                split_rngs={"params": False, "dropout": True},
-                in_axes=scan_axis,
-                out_axes=scan_axis,
-            )(self.feed_forward, None, feed_forward_input)
-            feed_forward_hidden_states = einops.rearrange(
-                feed_forward_hidden_states,
-                '... b s d -> ... (b s) d'
-            )
-        else:
-            feed_forward_hidden_states = self.feed_forward(feed_forward_input)
+        feed_forward_hidden_states = self.feed_forward(feed_forward_input)
 
         hidden_states = hidden_states + feed_forward_hidden_states
 
@@ -1161,13 +1031,11 @@ class RPTLowcoderLayerCollection(nn.ModuleList):
                 output_attentions,
                 fcm_mask,
             )
-            # TODO: Is this not useful?
             hidden_states = layer_outputs[0]
 
             if init_cache:
                 presents = presents + (layer_outputs[1],)
 
-            # TODO: Is this not useful?
             if output_attentions:
                 all_attentions += (layer_outputs[2 if init_cache else 1],)
 
@@ -1293,7 +1161,6 @@ class RPTChunkedCrossAttention(nn.Module):
         if num_document_chunks > 1:
             cross_attention_out = cross_attention_out.reshape([-1, num_devices_chunks * chunk_size, hidden_dim])
             # # pad back to original, with 0s at the beginning (which will be added to the residual and be fine)
-            # TODO: numpy
             cross_attention_out = torch.nn.functional.pad(cross_attention_out, (0, 0, causal_padding, 0, 0, 0), 'constant', 0)[:,:-causal_padding]
 
         cross_attention_out = cross_attention_out.reshape([num_devices, seq_len, hidden_dim])
@@ -1382,34 +1249,7 @@ class RPTUpcoderLayer(nn.Module):
 
         feed_forward_input = self.ffn_norm(hidden_states)
 
-        # TODO: PyTorch scan
-        if self.config.scan_mlp:
-            feed_forward_input = einops.rearrange(
-                feed_forward_input,
-                '... (b s) d -> ... b s d',
-                b=self.config.scan_mlp_chunk_size
-            )
-
-            def mlp_forward(mlp, carry, x):
-                return None, mlp(x, deterministic)
-
-            scan_axis = feed_forward_input.ndim - 3
-
-            _, feed_forward_hidden_states = nn.scan(
-                mlp_forward,
-                variable_broadcast="params",
-                split_rngs={"params": False, "dropout": True},
-                in_axes=scan_axis,
-                out_axes=scan_axis,
-            )(self.feed_forward, None, feed_forward_input)
-            feed_forward_hidden_states = einops.rearrange(
-                feed_forward_hidden_states,
-                '... b s d -> ... (b s) d'
-            )
-        else:
-            feed_forward_hidden_states = self.feed_forward(
-                feed_forward_input,
-            )
+        feed_forward_hidden_states = self.feed_forward(feed_forward_input)
 
         hidden_states = hidden_states + feed_forward_hidden_states
 
@@ -1566,16 +1406,13 @@ class RPTNeighborAugmentor(nn.Module):
 
 
 class RPTCrossNeighborAugmentor(nn.Module):
-    def __init__(self, config: RPTConfig, device_count, num_devices_chunks, num_neighbors, dtype: torch.dtype = torch.float32, device=None):
+    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None):
         super().__init__()
         self.config = config
         self.dtype = dtype
         self.cross_neig_causal_att = RPTAttention(self.config, dtype=self.dtype, device=device)
         self.xnei_norm1 = RPTRMSNorm(self.config, dtype=self.dtype)
         self.xnei_norm2 = RPTRMSNorm(self.config, dtype=self.dtype)
-        # [device_count, num_devices_chunks*num_neighbors, 1]
-        # TODO: handle initialization with dense init
-        # TODO: missing in_features, need to run to figure out
         self.weight = nn.Linear(in_features=self.config.hidden_size, out_features=1, dtype=self.dtype, bias=True)
         if self.config.use_xnei_bias:
             self.xnei_bias = nn.Parameter(torch.normal(mean=0, std=0.01, size=(1, 1, 1, self.config.hidden_size)))
@@ -1646,8 +1483,7 @@ class RPTUpcoder(nn.Module):
             self.neighbor_augmentor = None
 
         if self.config.augment_across_neighbors:
-            # TODO: Fix parameters
-            self.neighbor_cross_augmentor = RPTCrossNeighborAugmentor(self.config, device_count=1, dtype=self.dtype, device=device, num_neighbors=self.config.num_neighbors, num_devices_chunks=self.config.num_document_chunks)
+            self.neighbor_cross_augmentor = RPTCrossNeighborAugmentor(self.config, dtype=self.dtype, device=device)
         else:
             self.neighbor_cross_augmentor = None
         self.layers = RPTUpcoderLayerCollection(self.config, dtype=self.dtype)
@@ -1684,7 +1520,6 @@ class RPTUpcoder(nn.Module):
             neighbor_hidden_states = nei_xaug_outputs[0]
             past_key_values = nei_xaug_outputs[1]
 
-        # TODO: Change var name
         return neighbor_hidden_states, past_key_values
 
 
@@ -1737,7 +1572,6 @@ class RPTUpcoder(nn.Module):
             return_dict=return_dict,
         )
 
-        # TODO: Cringe
         outputs.past_key_values = {
             'upcoder': outputs.past_key_values,
             'augment': agument_past_key_values,
@@ -1754,7 +1588,6 @@ class RPTUpcoder(nn.Module):
         )
 
 
-# TODO: Is this a module in inference?
 class RPTRetriever(nn.Module):
     def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32):
         super().__init__()
@@ -1763,8 +1596,6 @@ class RPTRetriever(nn.Module):
         self.preret_bidir_attention = RPTCrossAttention(self.config, dtype=self.dtype)
         self.preret_bi_attention_norm = RPTRMSNorm(self.config, dtype=self.dtype)
         self.pre_key_norm = RPTRMSNorm(self.config, dtype=self.dtype)
-        # TODO: handle initialization
-        # TODO: handle input size
         self.key_projection = nn.Linear(
             in_features=self.config.hidden_size,
             out_features=self.config.hidden_size,
@@ -1772,8 +1603,6 @@ class RPTRetriever(nn.Module):
             bias=True
         )
         self.pre_query_norm = RPTRMSNorm(self.config, dtype=self.dtype)
-        # TODO: handle initialization
-        # TODO: handle input size
         self.query_projection = nn.Linear(
             in_features=self.config.hidden_size,
             out_features=self.config.hidden_size,
@@ -1791,7 +1620,6 @@ class RPTRetriever(nn.Module):
         original_hidden_states_shape = hidden_states.shape
         original_attention_mask_shape = attention_mask.shape
 
-        # TODO: verify equivilance
         original_hidden_states = einops.rearrange(hidden_states, 'b (l c) ... -> (b l) c ... ', c=self.config.chunk_size)
         attention_mask = einops.rearrange(attention_mask, 'b (l c) ... -> (b l) c ... ', c=self.config.chunk_size)
 
@@ -1824,8 +1652,6 @@ class RPTRetriever(nn.Module):
             preret_attention=preret_bi_output[1:])
 
 
-
-# TODO: Figure out the PyTorch version
 
 
 from transformers.generation.logits_process import LogitsProcessorList
@@ -1869,7 +1695,6 @@ class RPTPreTrainedModel(PreTrainedModel):
 
         return outputs
 
-    # TODO: Origianl usage
     def augment_forward(
             self,
             hidden_states,
@@ -1895,7 +1720,6 @@ class RPTPreTrainedModel(PreTrainedModel):
 
         return outputs, past_key_values.get("intermediates", None)
 
-    # TODO: Please look at the original usage
     def lowcoder_forward(
             self,
             input_ids,
@@ -2114,13 +1938,11 @@ class RPTPreTrainedModel(PreTrainedModel):
 
 class RPTModel(RPTPreTrainedModel):
 
-    def __init__(self, config: RPTConfig, dtype: torch.dtype = torch.float32, device=None):
+    def __init__(self, config: RPTConfig, device=None):
         super().__init__(config)
-        #self.dtype = dtype # TODO: Why?
         # the embedding dim
         self.embed_dim = self.config.hidden_size
 
-        # TODO: Comon size
         self.cached_array = torch.zeros(size=(1, config.chunk_size, config.hidden_size), dtype=self.dtype)
 
         # TODO: move this wte and dropout into the lowcoder.
@@ -2128,7 +1950,6 @@ class RPTModel(RPTPreTrainedModel):
         # define a dropout layer
         self.dropout = nn.Dropout(p=self.config.embd_pdrop)
 
-        # TODO: handle init
         # word to embedding module (layer)
         self.wte = nn.Embedding(
             self.config.vocab_size,  # input size
@@ -2147,7 +1968,6 @@ class RPTModel(RPTPreTrainedModel):
         # TODO: move this ln_f into the upcoder.
         self.ln_f = RPTRMSNorm(self.config, dtype=self.dtype)
 
-    # TODO: Verify correctness
     def _concatenate_to_lowcoder_cache(self, array):
         *batch_dims, _, hidden_dim = array.shape
         chunk_size = self.config.chunk_size
@@ -2197,7 +2017,6 @@ class RPTModel(RPTPreTrainedModel):
 
             input_embeds = self.wte(input_ids)
 
-            # TODO: Determinsitc
             hidden_states = self.dropout(input_embeds)
 
             lowcoder_outputs = self.lowcoder(
@@ -2259,7 +2078,7 @@ class RPTModel(RPTPreTrainedModel):
             past_key_values = upcoder_outputs.past_key_values
 
         if not return_dict:
-            return (hidden_states,) + upcoder_outputs + lowcoder_outputs, past_key_values  # TODO: Cringe
+            return (hidden_states,) + upcoder_outputs + lowcoder_outputs, past_key_values
 
         return RPTModelOutput(
             past_key_values=past_key_values,
@@ -2323,8 +2142,7 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
         super().__init__(config, dtype, *args, **kwargs)
         self.config = config
         self.dtype = dtype
-        self.transformer = RPTModel(self.config, dtype=self.dtype, device=device)
-        # TODO: initialize
+        self.transformer = RPTModel(self.config, device=device)
         self.lm_head = nn.Linear(
             in_features=self.config.hidden_size,
             out_features=self.config.vocab_size,
@@ -2368,7 +2186,6 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
         if retriever_supervision is not None:
             transformer_input.update(retriever_supervision=retriever_supervision)
 
-        # TODO: Useless
         def transformer(**kwargs):
             return self.transformer(
                 **kwargs,
@@ -2387,7 +2204,7 @@ class RPTForCausalLMModule(RPTPreTrainedModel):
         lm_logits = self.unembed(hidden_states)
 
         if not return_dict:
-            return (lm_logits,) + outputs[1:] # TODO: Handle cache
+            return (lm_logits,) + outputs[1:]
         return RPTLMOutput(
             logits=lm_logits,
             upcoder_hidden_states=outputs.upcoder_hidden_states,
