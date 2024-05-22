@@ -364,8 +364,8 @@ class RPTRMSNorm(nn.Module):
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0, dtype: torch.dtype = torch.float32, device=None) -> torch.Tensor:
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].type(dtype) / dim))
-    t = torch.arange(end)  # type: ignore
-    freqs = torch.outer(t, freqs).type(dtype)  # type: ignore
+    t = torch.arange(end)  #
+    freqs = torch.outer(t, freqs).type(dtype)
     sin, cos = torch.sin(freqs), torch.cos(freqs)
     freqs_cis = cos + 1j * sin
     return torch.asarray(freqs_cis).to(device)
@@ -385,10 +385,8 @@ def apply_rotary_emb_(
     xq_ = torch.complex(reshape_xq[..., 0], reshape_xq[..., 1])
     xk_ = torch.complex(reshape_xk[..., 0], reshape_xk[..., 1])
 
-    # add head dim
     freqs_cis = torch.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
 
-    # freqs_cis = (1, 1024, 1, 64)
     xq_out = xq_ * freqs_cis
     xq_out = torch.stack((torch.real(xq_out), torch.imag(xq_out)), dim=-1).reshape(*xq_out.shape[:-1], -1)
     if freqs_cis_k is None:
@@ -720,11 +718,9 @@ class RPTAttention(nn.Module):
 
         null_k = torch.broadcast_to(self.null_k, tuple(xk_shape))
         null_v = torch.broadcast_to(self.null_v, tuple(xk_shape))
-        # xk = torch.Size([1, 1024, 16, 128]), null_k=torch.Size([1, 1, 16, 128])
-        # xv = torch.Size([1, 1024, 16, 128]), null_v=torch.Size([1, 1, 16, 128])
-        xk = torch.concatenate((xk, null_k), dim=-3) # torch.Size([1, 1025, 16, 128])
-        xv = torch.concatenate((xv, null_v), dim=-3) # torch.Size([1, 1025, 16, 128])
-        attention_bias = torch.concatenate((attention_bias, torch.full(tuple(attention_bias_shape), 0.0)), dim=-1) # add last dim (embedding?)
+        xk = torch.concatenate((xk, null_k), dim=-3)
+        xv = torch.concatenate((xv, null_v), dim=-3)
+        attention_bias = torch.concatenate((attention_bias, torch.full(tuple(attention_bias_shape), 0.0)), dim=-1)
         return xv, xk, attention_bias
 
 
@@ -943,7 +939,6 @@ class RPTLowcoderLayer(nn.Module):
             output_attentions: bool = False,
             fcm_mask: Optional[torch.Tensor] = None,
     ):
-        # run self attention on the hidden states
         attn_outputs = self.attention(
             self.attention_norm(hidden_states),
             layer_past,
@@ -960,7 +955,6 @@ class RPTLowcoderLayer(nn.Module):
 
         outputs = attn_outputs[1:]
 
-        # nomalize hidden states
         feed_forward_input = self.ffn_norm(hidden_states)
 
         feed_forward_hidden_states = self.feed_forward(feed_forward_input)
@@ -1123,13 +1117,12 @@ class RPTChunkedCrossAttention(nn.Module):
         num_devices, seq_len, hidden_dim = hidden_states.shape
         num_document_chunks, num_neighbors, _, _ = neighbor_hidden_states.shape
 
-        # -> (-1, num_devices_chunks, num_neighbors, 2*chunk_size, hidden_dim)
+
         neighbor_hidden_states = neighbor_hidden_states.reshape([-1, 2 * chunk_size * num_neighbors, hidden_dim])
         neighbor_mask = neighbor_mask.reshape([-1, 2 * chunk_size * num_neighbors])
         local_device_count = hidden_states.shape[0]
         if num_document_chunks > 1:
             num_devices_chunks = num_document_chunks // local_device_count
-            # ->  (-1 ,chunk_size, hidden_dim)
             hidden_states = hidden_states.reshape([-1, num_devices_chunks * chunk_size, hidden_dim])
 
             hidden_states = torch.nn.functional.pad(hidden_states[:, causal_padding:, :], (0, 0, 0, causal_padding, 0, 0), 'constant', 0)
@@ -1146,7 +1139,6 @@ class RPTChunkedCrossAttention(nn.Module):
                                            (num_document_chunks * num_neighbors, 2 * chunk_size))
         kv_position_ids = kv_position_ids.reshape([-1, 2 * chunk_size * num_neighbors])
 
-        # cross attention
         output = self.cross_attention(
             hidden_states=hidden_states,
             key_value_states=neighbor_hidden_states,
@@ -1156,11 +1148,9 @@ class RPTChunkedCrossAttention(nn.Module):
             output_attentions=output_attentions,
             deterministic=deterministic)
 
-        # reshape back to original sequence
         cross_attention_out = output[0]
         if num_document_chunks > 1:
             cross_attention_out = cross_attention_out.reshape([-1, num_devices_chunks * chunk_size, hidden_dim])
-            # # pad back to original, with 0s at the beginning (which will be added to the residual and be fine)
             cross_attention_out = torch.nn.functional.pad(cross_attention_out, (0, 0, causal_padding, 0, 0, 0), 'constant', 0)[:,:-causal_padding]
 
         cross_attention_out = cross_attention_out.reshape([num_devices, seq_len, hidden_dim])
@@ -1452,7 +1442,7 @@ class RPTCrossNeighborAugmentor(nn.Module):
         pooled_neighbor_hidden_states = cross_neig_out[0] + pooled_neighbor_hidden_states
         pooled_neighbor_hidden_states = self.xnei_norm2(pooled_neighbor_hidden_states)
         ret_gate_score = self.weight(
-            pooled_neighbor_hidden_states)  # [device_count, num_devices_chunks*num_neighbors, 1]
+            pooled_neighbor_hidden_states)
         ret_gate_score = rearrange(ret_gate_score, 't (c k) 1 -> (t c) k 1 1 ',
                                    t=device_count, c=num_devices_chunks, k=num_neighbors)
 

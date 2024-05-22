@@ -550,20 +550,13 @@ class FlaxRPTRMSNorm(nn.Module):
     
     @jax.profiler.annotate_function
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        ####jax.debug.print('RMSNorm input: x={x}', x=jnp.array(x))
         x = x.astype(jnp.promote_types(self.dtype, jnp.float32))
-        ####jax.debug.print('RMSNorm promoted: x={x}', x=x)
         output = self._norm(x).astype(self.dtype)
-        ####jax.debug.print('RMSNorm output: output={output}', output=output)
         weight = jnp.asarray(self.weight, self.dtype)
-        ####jax.debug.print('RMSNorm weight: weight={weight}', weight=weight)
-        ####jax.debug.print('RMSNorm self.config.rms_one_baseline: x={x}', x=self.config.rms_one_baseline)
         if self.config.rms_one_baseline:
             out = output * (1 - weight)
         else:
             out = output * weight
-
-        ####jax.debug.print('RMSNorm out: out={out}', out=out)
 
         return out
 
@@ -773,9 +766,6 @@ class FlaxRPTAttention(nn.Module):
         cache_index = self.variable("cache", "cache_index", lambda: jnp.array(0, dtype=jnp.int32))
         attention_mask = attention_mask.astype(int)
 
-        ###jax.debug.print("key_to_cache={x}",x=key)
-        ###jax.debug.print("value_to_cache={x}",x=value)
-
         if is_initialized:
             *batch_dims, max_length, num_heads, depth_per_head = cached_key.value.shape
             # update key, value caches with our new 1d spatial slices
@@ -811,16 +801,9 @@ class FlaxRPTAttention(nn.Module):
 
                 mask_operand = jnp.roll(cache_mask.value, shift=-num_updated_cache_vectors, axis=-1)
 
-                ##jax.debug.print('cache_mask={x}', x=cache_mask.value)
-                ##jax.debug.print('mask_operand={x}', x=mask_operand)
-                ##jax.debug.print('(0,) * len(batch_dims)+ (shift,)={x}', x=(0,) * len(batch_dims)+ (shift,))
-                ##jax.debug.print('start: attention_mask={x}', x=attention_mask)
-
                 attention_mask = lax.dynamic_update_slice(mask_operand,
                                                         attention_mask.astype(mask_operand.dtype),
                                                         (0,) * len(batch_dims)+ (shift,))
-
-                ##jax.debug.print('end: attention_mask={x}', x=attention_mask)
 
                 return key, value, attention_mask
             
@@ -854,16 +837,8 @@ class FlaxRPTAttention(nn.Module):
         n_windows=self.config.n_windows
         # stride = self.config.stride if not disable_cache else None
 
-        #jax.debug.print('hidden_states={hidden_states}', hidden_states=hidden_states)
-
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
-        #jax.debug.print('xq={x}', x=xq)
-        #jax.debug.print('xk={x}', x=xk)
-        #jax.debug.print('xv={x}', x=xv)
-
-        # xq = torch.Size([1, 1024, 2048]) -> torch.Size([1, 1024, 16, 128])
-        # xq = (1, 2048, 2048) -> (1, 2048, 16, 128)
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
         xv = self._split_heads(xv)
@@ -874,16 +849,11 @@ class FlaxRPTAttention(nn.Module):
         query_attention_mask = attention_mask
 
 
-        #jax.debug.print('A: attention_mask={x}',x=attention_mask)
 
         if (self.has_variable("cache", "cached_key") or init_cache) and not disable_cache:
             xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask)
 
         key_length = xk.shape[-3]
-
-        #jax.debug.print('B: attention_mask={x}',x=attention_mask)
-
-        ###jax.debug.print('post_cache: xq={xq}\nxk={xk}\nxv={xv}', xq=xq, xk=xk, xv=xv)
 
         position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(query_attention_mask, axis=-1) - 1, a_min=0),
@@ -896,12 +866,8 @@ class FlaxRPTAttention(nn.Module):
                         jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
                         (batch_size, key_length)
                     ).astype(int)
-                #jax.debug.print('cumsum={x}', x=jnp.cumsum(attention_mask, axis=-1))
-                #jax.debug.print('position_ids_k={position_ids_k}', position_ids_k=position_ids_k)
                 freqs_cis_k = jnp.take(self.freqs_cis, position_ids_k, axis=0)
-                #jax.debug.print('freqs_cis_k={freqs_cis_k}', freqs_cis_k=freqs_cis_k)
                 position_ids += position_ids_k.max()-position_ids.max()
-                #jax.debug.print('position_ids={position_ids}', position_ids=position_ids)
                 freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
             else:
                 position_ids_k = position_ids
@@ -915,7 +881,6 @@ class FlaxRPTAttention(nn.Module):
         
 
         freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
-        ##jax.debug.print('freqs_cis={freqs_cis}', freqs_cis=freqs_cis)
 
         if self.has_variable("cache", "cached_key"):
             causal_mask =  nn.make_attention_mask(position_ids, position_ids_k, lambda x,y:x>=y,
@@ -937,8 +902,6 @@ class FlaxRPTAttention(nn.Module):
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis,
                                     freqs_cis_k=freqs_cis_k,
                                     dtype=self.dtype, rot_dim=self.config.rot_dim)
-
-        #jax.debug.print('xq_rot={xq}\nxk_rot={xk}', xq=xq, xk=xk)
 
 
         # transform boolean mask into float mask
@@ -995,13 +958,6 @@ class FlaxRPTAttention(nn.Module):
             if self.config.add_null_attn:
                 xv, xk, attention_bias = self.concat_null_kv(xv, xk, attention_bias)
 
-            #jax.debug.print('attn_input_mask: {x}', x=attention_mask)
-            #jax.debug.print('attn_input: xq_rot_null={xq}\nxk_rot_null={xk}', xq=xq,   xk=xk)
-            #jax.debug.print('bias={x}', x=attention_bias)
-
-            # xq = (1, 1024, 32, 128)
-            # xk = (1, 1024, 32, 128)
-            # attention_bias = (1, 1, 1024, 1024)
             attn_weights = dot_product_attention_weights(
                 xq,
                 xk,
@@ -1013,8 +969,6 @@ class FlaxRPTAttention(nn.Module):
                 precision=self.precision,
             )
 
-            #jax.debug.print('attn_weights={attn_weights}', attn_weights=attn_weights)
-
 
             print(f"{attn_weights.shape=}")
             self.sow('intermediates', 'attn_weights', attn_weights)
@@ -1025,8 +979,6 @@ class FlaxRPTAttention(nn.Module):
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.wo(attn_output)
-
-        ###jax.debug.print('attn_output={attn_output}', attn_output=attn_output)
 
 
         # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
@@ -1129,15 +1081,11 @@ class FlaxRPTCrossAttention(nn.Module):
         
         is_cross_attention = key_value_states is not None
 
-        ####jax.debug.print('hidden_states={hidden_states}', hidden_states=hidden_states)
-        
         if not is_cross_attention:
             xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
         else:
             xq, xk, xv = self.wq(hidden_states), self.wk(key_value_states), self.wv(key_value_states)
 
-        ####jax.debug.print('cross attention: xq={xq}\nxk={xk}\nxv={xv}', xq=xq, xk=xk, xv=xv)
-   
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
         xv = self._split_heads(xv)
@@ -1167,9 +1115,7 @@ class FlaxRPTCrossAttention(nn.Module):
         null_v = jnp.broadcast_to(self.null_v, (batch_size, 1, self.num_heads, self.head_dim))
         xv = jnp.concatenate((xv, null_v), axis = -3)
         
-        # attention_mask = (16, 64)
         if attention_mask is not None:
-            
             null_mask = jnp.ones((attention_mask.shape[0], 1), dtype=jnp.float32)
             attention_mask = jnp.concatenate((attention_mask, null_mask), axis = -1)
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
@@ -1185,8 +1131,6 @@ class FlaxRPTCrossAttention(nn.Module):
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
 
-        ####jax.debug.print('cross attention: dot_product_attention_weights: xq={xq}\nxk={xk}', xq=xq, xk=xk)
-
         attn_weights = dot_product_attention_weights(
             xq,
             xk,
@@ -1198,20 +1142,11 @@ class FlaxRPTCrossAttention(nn.Module):
             precision=self.precision,
         )
 
-        ####jax.debug.print('cross attention results: attn_weights={attn_weights}', attn_weights=attn_weights)
-
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
-
-        ####jax.debug.print('cross attention attn_output: {x}', x=attn_output)
 
         attn_output = self._merge_heads(attn_output)
 
-        ####jax.debug.print('cross attention attn_output: {x}', x=attn_output)
-
         attn_output = self.wo(attn_output)
-
-        ####jax.debug.print("wo={wo}", wo=dict(self.wo.variables)['params']['kernel'])
-        ####jax.debug.print('cross attention after wo attn_output: {x}', x=attn_output)
 
         # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
@@ -1258,7 +1193,6 @@ class FlaxRPTMLP(nn.Module):
         self.dropout = nn.Dropout(rate=self.config.resid_pdrop,broadcast_dims=(0,))
     @jax.profiler.annotate_function
     def __call__(self, x: jnp.ndarray, deterministic: bool = True) -> jnp.ndarray:
-        ##jax.debug.print('MLPInput: {x}', x=x)
         if self.config.gated_ff:
             x1 = nn.silu(self.w1(x))
             x3 = self.w3(x)
@@ -1276,7 +1210,6 @@ class FlaxRPTMLP(nn.Module):
 
         return x
 
-# from transformers.modeling_flax_utils import 
 from transformers.generation.flax_logits_process import FlaxLogitsProcessorList
 from transformers.generation.flax_utils import SampleState
 
@@ -1590,8 +1523,6 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
 
             next_token = jax.random.categorical(prng_key, logits, axis=-1)
 
-            jax.debug.print('next_token={x}', x=next_token)
-
             next_is_sent_finished = state.is_sent_finished | (next_token == eos_token_id)
             next_token = next_token * ~next_is_sent_finished + pad_token_id * next_is_sent_finished
             next_token = next_token[:, None]
@@ -1889,7 +1820,6 @@ class FlaxRPTChunkedCrossAttention(nn.Module):
         local_device_count = hidden_states.shape[0]
         if num_document_chunks > 1:
             num_devices_chunks = num_document_chunks//local_device_count
-            # ->  (-1 ,chunk_size, hidden_dim)
             hidden_states = hidden_states.reshape([-1, num_devices_chunks*chunk_size, hidden_dim])
             hidden_states = jnp.pad(hidden_states[:,causal_padding:,:], ((0,0),(0, causal_padding),(0,0)), 'constant')
             hidden_states = hidden_states.reshape([-1,chunk_size, hidden_dim])
@@ -1897,7 +1827,6 @@ class FlaxRPTChunkedCrossAttention(nn.Module):
             position_ids = jnp.arange(chunk_size)+chunk_size-1
             position_ids = jnp.broadcast_to(position_ids[None, :], (hidden_states.shape[0], chunk_size))
         else:
-            ####jax.debug.print("hidden_states = hidden_states.reshape([1, 1, hidden_dim]): shape={shape}, hidden_dim={hidden_dim}", shape=hidden_states.shape, hidden_dim=hidden_dim)
             hidden_states = hidden_states.reshape([1,1, hidden_dim])
             assert position_ids is not None
 
@@ -2679,12 +2608,7 @@ class FlaxRPTModule(nn.Module):
 
         
         if upcoder_input is None:
-            ###jax.debug.print('input_ids={input_ids}', input_ids=input_ids)
-
             input_embeds = self.wte(input_ids.astype("i4"))
-
-            ###jax.debug.print('input_embeds={input_embeds}', input_embeds=input_embeds)
-
             hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
             # (1. 1024, 2048)
@@ -2698,13 +2622,10 @@ class FlaxRPTModule(nn.Module):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
             )
-            
 
             hidden_states = lowcoder_outputs.last_hidden_state if  return_dict else lowcoder_outputs[0]
             if self.has_variable("cache", "cached_array") or init_cache:
                 self._concatenate_to_lowcoder_cache(hidden_states)
-
-            ###jax.debug.print('lowcoder output: x={x}', x=jnp.array(hidden_states))
 
             retriever_input = hidden_states
             if self.retriever is not None:
@@ -2793,8 +2714,6 @@ class FlaxRPTForCausalLMModule(nn.Module):
             attention_mask=attention_mask,
             **kwargs
         )
-
-        ####jax.debug.print('lowcoder_forward={outputs}', outputs=outputs)
 
         return outputs
 
@@ -2895,18 +2814,13 @@ class FlaxRPTForCausalLMModule(nn.Module):
         )
     @jax.profiler.annotate_function
     def unembed(self, hidden_states):
-        #jax.debug.print('unembed input={x}', x=hidden_states)
-        ##jax.debug.print('unembed hidden states={x}', x=self.transformer.variables["params"]["wte"]["embedding"].T)
         if self.config.tie_word_embeddings:
             shared_kernel = self.transformer.variables["params"]["wte"]["embedding"].T
             lm_logits = self.lm_head.apply({"params": {"kernel": shared_kernel}}, hidden_states)
-            ##jax.debug.print('lm_logits={x}', x=lm_logits)
         else:
             lm_logits = self.lm_head(hidden_states)
         if self.config.palm_init:
             lm_logits = lm_logits/jnp.sqrt(hidden_states.shape[-1])
-
-        jax.debug.print('lm_logits={x}', x=lm_logits)
 
         return lm_logits
 
