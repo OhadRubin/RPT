@@ -36,7 +36,6 @@ def gelu(x):
 def silu(x):
     return x * torch.sigmoid(x)
 
-# TODO: Fix cringe naming
 def assign_slice(operand, update, start_indexes):
     slice_indicies = []
 
