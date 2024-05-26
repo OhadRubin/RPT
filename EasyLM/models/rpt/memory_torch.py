@@ -1,7 +1,6 @@
 
 
 import numpy as np
-import jax
 import math
 import numpy as np
 from multiprocessing import Pool, cpu_count
@@ -43,7 +42,6 @@ class Memory:
   
   def add(self, input_tokens, append=True, **kwargs):
     # converts the elements in kwargs to np.float32
-    kwargs = jax.tree_map(lambda x: jax.device_get(x).astype(np.float32), kwargs)
     return self._add(input_tokens, append=append, **kwargs)
 
   def _add(self, input_tokens, encoded_hidden_states, key_chunks=None, query_chunks=None, append=True):

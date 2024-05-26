@@ -413,7 +413,7 @@ class LMServer(object):
                 queue=False
             )
 
-        gradio_chatbot.queue(concurrency_count=1)
+        gradio_chatbot.queue(default_concurrency_limit=1)
         return gradio_chatbot
 
     def run(self):

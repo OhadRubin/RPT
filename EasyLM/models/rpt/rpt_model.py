@@ -1,8 +1,5 @@
-import os
-from shutil import copyfile
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, Tuple, Union
 import json
-import tempfile
 
 
 import numpy as np
@@ -18,37 +15,29 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from flax.linen import partitioning as nn_partitioning
 import einops
 
-import sentencepiece as spm
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
-from transformers.tokenization_utils import PreTrainedTokenizer
-from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput, FlaxSeq2SeqModelOutput,FlaxSeq2SeqLMOutput,ModelOutput
-from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
-from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging
-from flax.linen.dtypes import promote_dtype
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput
+from transformers.modeling_flax_utils import FlaxPreTrainedModel
+from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward
 from ml_collections import ConfigDict
-from ml_collections.config_dict import config_dict
 from mlxu import function_args_to_config, load_pickle, open_file
 
 from EasyLM.memory_efficient_attention import dot_product_attention_multihead as efficient_dot_product_attention
 from EasyLM.jax_utils import (
-    with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy,put_along_zeroth_axis, create_target_scores,add_process_dim,remove_process_dim
+    get_jax_mesh, get_gradient_checkpoint_policy, create_target_scores, add_process_dim, remove_process_dim
 )
 from einops import rearrange
 import flax
 import gin
-from functools import partial
-from jax.experimental.shard_map import shard_map
-from absl import logging
+
 from collections import namedtuple
 import optax
 import rax
 import operator
-from typing import Any, Callable, Optional, Sequence, TypeVar
+from typing import Optional
 from transformers.utils import ModelOutput
 from transformers import AutoTokenizer
-import copy
-RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])    
+RetrieverSupervision = namedtuple('RetrieverSupervision', ['nei_scores', 'nei_idx'])
 # EncodedNeighbors = namedtuple('EncodedNeighbors', ['neighbor_hidden_states', 'neighbor_mask',"retriever_input"])    
 EncodedNeighbors = namedtuple('EncodedNeighbors', ['neighbor_hidden_states', 'neighbor_mask',"chunk_index"])    
 # from flax.struct import PyTreeNode
@@ -66,7 +55,6 @@ def dense_init(config,is_embedding=False):
         return jax.nn.initializers.variance_scaling(config.initializer_range, 'fan_in', 'normal', out_axis=0)
     else:
         return jax.nn.initializers.normal(stddev=config.initializer_range)
-
 
 @flax.struct.dataclass
 class FlaxBaseModelOutputCrossAttentions(ModelOutput):
@@ -532,6 +520,9 @@ remat = nn_partitioning.remat
 
 
 class FlaxRPTRMSNorm(nn.Module):
+    """
+    RMS normalization layer
+    """
     config: RPTConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype = jnp.float32
@@ -563,9 +554,11 @@ class FlaxRPTRMSNorm(nn.Module):
         output = self._norm(x).astype(self.dtype)
         weight = jnp.asarray(self.weight, self.dtype)
         if self.config.rms_one_baseline:
-            return output * (1 - weight)
+            out = output * (1 - weight)
         else:
-            return output * weight
+            out = output * weight
+
+        return out
 
 @jax.profiler.annotate_function
 def precompute_freqs_cis(dim: int, end: int, theta: float=10000.0, dtype: jnp.dtype=jnp.float32) -> jnp.ndarray:
@@ -584,7 +577,6 @@ def apply_rotary_emb_(
     dtype: jnp.dtype=jnp.float32,
     freqs_cis_k: jnp.ndarray = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-
     reshape_xq = xq.astype(jnp.float32).reshape(*xq.shape[:-1], -1, 2)
     reshape_xk = xk.astype(jnp.float32).reshape(*xk.shape[:-1], -1, 2)
 
@@ -592,8 +584,10 @@ def apply_rotary_emb_(
     xk_ = jax.lax.complex(reshape_xk[..., 0], reshape_xk[..., 1])
 
     # add head dim
+    # freqs_cis = (1, 1024, 64)
     freqs_cis = jnp.reshape(freqs_cis, (*freqs_cis.shape[:2], 1, *freqs_cis.shape[2:]))
 
+    # freqs_cis = (1, 1024, 1, 64)
     xq_out = xq_ * freqs_cis
     xq_out = jnp.stack((jnp.real(xq_out), jnp.imag(xq_out)), axis=-1).reshape(*xq_out.shape[:-1], -1)
     if freqs_cis_k is None:
@@ -673,6 +667,9 @@ def repeat_kv(hidden_states, n_rep: int):
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 class FlaxRPTAttention(nn.Module):
+    """
+    The transformer's masked self attention layer
+    """
     config: RPTConfig
     dtype: jnp.dtype=jnp.float32
     param_dtype: jnp.dtype=jnp.float32
@@ -738,9 +735,19 @@ class FlaxRPTAttention(nn.Module):
 
     @jax.profiler.annotate_function
     def _split_heads(self, hidden_states):
+        """
+        Split the hidden states (1, 1024, 4096) = (1, input_length, embedding_length)
+        into 32 heads with 128 dims each. i.e each token embedding is broken into 32 token embeddings for 32 heads.
+        [
+            [ token 0 embedding "block", token 1 embedding "block", ..., token 1023 embedding "block"]
+        ]
+        """
         return hidden_states.reshape(hidden_states.shape[:2] + (self.num_heads, self.head_dim))
     @jax.profiler.annotate_function
     def _merge_heads(self, hidden_states):
+        """
+        Merge the 32 embeddings back into a singular embeddings (i.e concatenation)
+        """
         return hidden_states.reshape(hidden_states.shape[:2] + (self.embed_dim,))
     
 
@@ -793,9 +800,11 @@ class FlaxRPTAttention(nn.Module):
                                                 indices)
 
                 mask_operand = jnp.roll(cache_mask.value, shift=-num_updated_cache_vectors, axis=-1)
+
                 attention_mask = lax.dynamic_update_slice(mask_operand,
                                                         attention_mask.astype(mask_operand.dtype),
                                                         (0,) * len(batch_dims)+ (shift,))
+
                 return key, value, attention_mask
             
 
@@ -828,7 +837,6 @@ class FlaxRPTAttention(nn.Module):
         n_windows=self.config.n_windows
         # stride = self.config.stride if not disable_cache else None
 
-        
         xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
 
         xq = self._split_heads(xq)
@@ -839,12 +847,14 @@ class FlaxRPTAttention(nn.Module):
         query_length = xq.shape[-3]
         batch_size = hidden_states.shape[0]
         query_attention_mask = attention_mask
+
+
+
         if (self.has_variable("cache", "cached_key") or init_cache) and not disable_cache:
-            xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask)            
+            xk, xv, attention_mask = self._concatenate_to_cache(xk, xv, xq, attention_mask)
+
         key_length = xk.shape[-3]
 
-
-            
         position_ids = jnp.broadcast_to(
                 jnp.clip(jnp.cumsum(query_attention_mask, axis=-1) - 1, a_min=0),
                 (batch_size, query_length)
@@ -870,11 +880,9 @@ class FlaxRPTAttention(nn.Module):
             attention_mask = rearrange(attention_mask, 'b (s l) -> (b s) l',s=n_windows)
         
 
-            
         freqs_cis = jnp.take(self.freqs_cis, position_ids, axis=0)
-            
 
-        if self.has_variable("cache", "cached_key"): 
+        if self.has_variable("cache", "cached_key"):
             causal_mask =  nn.make_attention_mask(position_ids, position_ids_k, lambda x,y:x>=y,
                                 extra_batch_dims=0, dtype=bool)
         else:
@@ -894,6 +902,7 @@ class FlaxRPTAttention(nn.Module):
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis,
                                     freqs_cis_k=freqs_cis_k,
                                     dtype=self.dtype, rot_dim=self.config.rot_dim)
+
 
         # transform boolean mask into float mask
         with jax.profiler.TraceAnnotation("attention_bias"):
@@ -948,6 +957,7 @@ class FlaxRPTAttention(nn.Module):
 
             if self.config.add_null_attn:
                 xv, xk, attention_bias = self.concat_null_kv(xv, xk, attention_bias)
+
             attn_weights = dot_product_attention_weights(
                 xq,
                 xk,
@@ -958,6 +968,8 @@ class FlaxRPTAttention(nn.Module):
                 dtype=jnp.promote_types(self.dtype, jnp.float32),
                 precision=self.precision,
             )
+
+
             print(f"{attn_weights.shape=}")
             self.sow('intermediates', 'attn_weights', attn_weights)
             attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
@@ -967,13 +979,15 @@ class FlaxRPTAttention(nn.Module):
 
         attn_output = self._merge_heads(attn_output)
         attn_output = self.wo(attn_output)
+
+
         # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
+
         return outputs
     
     @jax.profiler.annotate_function
     def concat_null_kv(self, xv, xk, attention_bias):
-        
         attention_bias_shape = np.array(attention_bias.shape)
         attention_bias_shape[-1] = 1
         xk_shape = np.array(xk.shape)
@@ -1066,13 +1080,12 @@ class FlaxRPTCrossAttention(nn.Module):
     ) -> Tuple[jnp.ndarray]:
         
         is_cross_attention = key_value_states is not None
-        
-        
+
         if not is_cross_attention:
             xq, xk, xv = self.wq(hidden_states), self.wk(hidden_states), self.wv(hidden_states)
         else:
             xq, xk, xv = self.wq(hidden_states), self.wk(key_value_states), self.wv(key_value_states)
-   
+
         xq = self._split_heads(xq)
         xk = self._split_heads(xk)
         xv = self._split_heads(xv)
@@ -1102,9 +1115,7 @@ class FlaxRPTCrossAttention(nn.Module):
         null_v = jnp.broadcast_to(self.null_v, (batch_size, 1, self.num_heads, self.head_dim))
         xv = jnp.concatenate((xv, null_v), axis = -3)
         
-                
         if attention_mask is not None:
-            
             null_mask = jnp.ones((attention_mask.shape[0], 1), dtype=jnp.float32)
             attention_mask = jnp.concatenate((attention_mask, null_mask), axis = -1)
             attention_mask = jnp.expand_dims(attention_mask, axis=(-3, -2))
@@ -1120,7 +1131,6 @@ class FlaxRPTCrossAttention(nn.Module):
         if not deterministic and self.config.attn_pdrop > 0.0:
             dropout_rng = self.make_rng("dropout")
 
-
         attn_weights = dot_product_attention_weights(
             xq,
             xk,
@@ -1131,10 +1141,13 @@ class FlaxRPTCrossAttention(nn.Module):
             dtype=jnp.promote_types(self.dtype, jnp.float32),
             precision=self.precision,
         )
+
         attn_output = jnp.einsum("...hqk,...khd->...qhd", attn_weights, xv, precision=self.precision)
 
         attn_output = self._merge_heads(attn_output)
+
         attn_output = self.wo(attn_output)
+
         # attn_output = self.resid_dropout(attn_output, deterministic=deterministic)
         outputs = (attn_output, attn_weights) if output_attentions else (attn_output,)
         return outputs
@@ -1197,7 +1210,6 @@ class FlaxRPTMLP(nn.Module):
 
         return x
 
-# from transformers.modeling_flax_utils import 
 from transformers.generation.flax_logits_process import FlaxLogitsProcessorList
 from transformers.generation.flax_utils import SampleState
 
@@ -1264,6 +1276,8 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
         init_variables = self.module.init(
             jax.random.PRNGKey(0), input_ids, attention_mask, position_ids, return_dict=False, init_cache=True
         )
+
+        # cache contains the structure of the transformer -> lowcoder, upcoder and a cached array (1, 64, 2048)
         return init_variables["cache"]
 
     @add_start_docstrings_to_model_forward("")
@@ -1456,7 +1470,7 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
         max_length = max_length if max_length is not None else self.generation_config.max_length
         pad_token_id = pad_token_id if pad_token_id is not None else self.generation_config.pad_token_id
         eos_token_id = eos_token_id if eos_token_id is not None else self.generation_config.eos_token_id
-        prng_key = prng_key if prng_key is not None else jax.random.PRNGKey(0)
+        prng_key = jax.random.PRNGKey(0) # prng_key if prng_key is not None else jax.random.PRNGKey(0)
 
         batch_size, cur_len = input_ids.shape
 
@@ -1547,6 +1561,9 @@ class FlaxRPTPreTrainedModel(FlaxPreTrainedModel):
     
 
 class FlaxRPTLowcoderLayer(nn.Module):
+    """
+
+    """
     config: RPTConfig
     dtype: jnp.dtype=jnp.float32
     param_dtype: jnp.dtype=jnp.float32
@@ -1592,6 +1609,7 @@ class FlaxRPTLowcoderLayer(nn.Module):
         output_attentions: bool = False,
         fcm_mask: Optional[jnp.ndarray] = None,
     ):
+        # run self attention on the hidden states
         attn_outputs = self.attention(
             self.attention_norm(hidden_states),
             attention_mask,
@@ -1602,11 +1620,14 @@ class FlaxRPTLowcoderLayer(nn.Module):
             fcm_mask,
             sliding_window=self.config.sliding_window,
         )
+
         attn_output = attn_outputs[0]
         hidden_states = hidden_states + attn_output
 
+        # nomalize hidden states
         feed_forward_input = self.ffn_norm(hidden_states)
 
+        # run the nomlaized hidden states into the MLP
         if self.config.scan_mlp:
             feed_forward_input = einops.rearrange(
                 feed_forward_input,
@@ -1643,6 +1664,9 @@ class FlaxRPTLowcoderLayer(nn.Module):
     
 
 class FlaxRPTLowcoderLayerCollection(nn.Module):
+    """
+    Basic series of masked attention encoders
+    """
     config: RPTConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype=jnp.float32
@@ -1715,9 +1739,12 @@ class FlaxRPTLowcoderLayerCollection(nn.Module):
 
 
 class FlaxRPTLowcoder(nn.Module):
+    """
+    Just a bunch of attention layers
+    """
     config: RPTConfig
-    dtype: jnp.dtype = jnp.float32
-    param_dtype: jnp.dtype=jnp.float32
+    dtype: jnp.dtype = jnp.float32 # type of embedding
+    param_dtype: jnp.dtype=jnp.float32 # type of input
     precision: Optional[Union[jax.lax.Precision, str]]=None
 
     def setup(self):        
@@ -1791,9 +1818,8 @@ class FlaxRPTChunkedCrossAttention(nn.Module):
         neighbor_hidden_states = neighbor_hidden_states.reshape([-1, 2*chunk_size*num_neighbors, hidden_dim])
         neighbor_mask = neighbor_mask.reshape([-1, 2*chunk_size*num_neighbors])
         local_device_count = hidden_states.shape[0]
-        if num_document_chunks>1:
+        if num_document_chunks > 1:
             num_devices_chunks = num_document_chunks//local_device_count
-            # ->  (-1 ,chunk_size, hidden_dim)
             hidden_states = hidden_states.reshape([-1, num_devices_chunks*chunk_size, hidden_dim])
             hidden_states = jnp.pad(hidden_states[:,causal_padding:,:], ((0,0),(0, causal_padding),(0,0)), 'constant')
             hidden_states = hidden_states.reshape([-1,chunk_size, hidden_dim])
@@ -2174,6 +2200,9 @@ class FlaxRPTCrossNeighborAugmentor(nn.Module):
         return (neighbor_hidden_states,) + cross_neig_out[1:]
 
 class FlaxRPTUpcoder(nn.Module):
+    """
+
+    """
     config: RPTConfig
     dtype: jnp.dtype = jnp.float32
     param_dtype: jnp.dtype=jnp.float32
@@ -2395,9 +2424,9 @@ class FlaxRPTRetriever(nn.Module):
                output_attentions: bool = False,):
         original_hidden_states_shape = hidden_states.shape
         original_attention_mask_shape = attention_mask.shape
-        
+
         original_hidden_states, attention_mask = jax.tree_map(
-                lambda x: einops.rearrange(x, 'b (l c) ... -> (b l) c ... ', c=self.config.chunk_size), 
+                lambda x: einops.rearrange(x, 'b (l c) ... -> (b l) c ... ', c=self.config.chunk_size),
                 (hidden_states, attention_mask)
                 ) # add a chunk dimension
         #1. apply bi-dir attention 
@@ -2505,15 +2534,21 @@ class FlaxRPTModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]]=None
 
     def setup(self):
+        # the embedding dim
         self.embed_dim = self.config.hidden_size
+
         #TODO: move this wte and dropout into the lowcoder.
+
+        # define a dropout layer
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
+
+        # word to embedding module (layer)
         self.wte = nn.Embed(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            embedding_init=dense_init(self.config, is_embedding=True),
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
+            self.config.vocab_size, # input size
+            self.config.hidden_size, # embedding size
+            embedding_init=dense_init(self.config, is_embedding=True), # basically np.random of weights in the correct size
+            dtype=self.dtype, # type of embedding vector entries
+            param_dtype=self.param_dtype, # type of input
         )
         
         self.lowcoder = FlaxRPTLowcoder(self.config, dtype=self.dtype, param_dtype=self.param_dtype, precision=self.precision)
@@ -2574,11 +2609,11 @@ class FlaxRPTModule(nn.Module):
         
         if upcoder_input is None:
             input_embeds = self.wte(input_ids.astype("i4"))
-
             hidden_states = self.dropout(input_embeds, deterministic=deterministic)
 
+            # (1. 1024, 2048)
             lowcoder_outputs = self.lowcoder(
-                hidden_states,
+                hidden_states, # (1, 1024, 2048)
                 attention_mask,
                 position_ids=position_ids,
                 deterministic=deterministic,
@@ -2587,12 +2622,11 @@ class FlaxRPTModule(nn.Module):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
             )
-            
 
-            hidden_states = lowcoder_outputs.last_hidden_state if  return_dict else lowcoder_outputs[0] 
+            hidden_states = lowcoder_outputs.last_hidden_state if  return_dict else lowcoder_outputs[0]
             if self.has_variable("cache", "cached_array") or init_cache:
                 self._concatenate_to_lowcoder_cache(hidden_states)
-                
+
             retriever_input = hidden_states
             if self.retriever is not None:
                 if encoded_neighbors is not None:
@@ -2605,8 +2639,8 @@ class FlaxRPTModule(nn.Module):
                                                     retriever_supervision=retriever_supervision,
                                                     deterministic=deterministic,
                                                     train_step=train_step)
-                    neighbor_hidden_states = retriever_output.neighbor_hidden_states
-                    neighbor_mask = retriever_output.neighbor_mask     
+                    neighbor_hidden_states = retriever_output.neighbor_hidden_states # (16, 2, 128, 2048)
+                    neighbor_mask = retriever_output.neighbor_mask # (16, 2, 128)
         else:
             hidden_states = upcoder_input.hidden_states
             attention_mask = upcoder_input.attention_mask
@@ -2614,7 +2648,7 @@ class FlaxRPTModule(nn.Module):
             neighbor_mask = upcoder_input.neighbor_mask
         
         
-        upcoder_outputs = self.upcoder(
+        upcoder_outputs = self.upcoder( # (1,1024, 2048)
             hidden_states,
             attention_mask,
             position_ids=position_ids,
@@ -2666,6 +2700,9 @@ class FlaxRPTForCausalLMModule(nn.Module):
             **kwargs
         )
     def _lowcoder_forward(self, input_ids, attention_mask, **kwargs):
+        """
+
+        """
         lowcoder_outputs = self.transformer.lowcoder(
             self.transformer.wte(input_ids.astype("i4")),
             attention_mask,
@@ -2677,6 +2714,7 @@ class FlaxRPTForCausalLMModule(nn.Module):
             attention_mask=attention_mask,
             **kwargs
         )
+
         return outputs
 
     def _augment_forward(self,
@@ -2783,6 +2821,7 @@ class FlaxRPTForCausalLMModule(nn.Module):
             lm_logits = self.lm_head(hidden_states)
         if self.config.palm_init:
             lm_logits = lm_logits/jnp.sqrt(hidden_states.shape[-1])
+
         return lm_logits
 
 
@@ -2790,7 +2829,6 @@ class FlaxRPTForCausalLMModule(nn.Module):
 @add_start_docstrings("", "")
 class FlaxRPTForCausalLM(FlaxRPTPreTrainedModel):
     module_class = FlaxRPTForCausalLMModule
-
     def prepare_inputs_for_generation(self, input_ids,
                                       max_length,
                                       attention_mask = None,
